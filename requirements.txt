@@ -1,0 +1,5 @@
+google-genai
+notion-client
+pydantic
+python-dotenv
+requests
