@@ -19,9 +19,9 @@ def send(text: str) -> bool:
     }
     return requests.post(URL, headers=HEADERS, json=payload).status_code in (200, 201)
 
-def read(limit: int = 1) -> list[str]:
+def read(limit: int = 1) -> list[dict]:
     res = requests.get(f"{URL}?pageSize={limit}", headers=HEADERS)
-    return [m.get("content", "") for m in res.json().get("messages", [])]
+    return res.json().get("messages", [])
 
 if __name__ == "__main__":
     for msg in read():

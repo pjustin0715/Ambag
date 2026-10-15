@@ -3,3 +3,4 @@ notion-client
 pydantic
 python-dotenv
 requests
+nltk
