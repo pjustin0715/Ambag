@@ -26,6 +26,7 @@ notion = Client(auth=NOTION_TOKEN)
 _DB_INFO = notion.databases.retrieve(NOTION_DB_ID)
 DATA_SOURCE_ID = _DB_INFO["data_sources"][0]["id"]
 _flowchart_block_id = None
+recent_tasks = deque(maxlen=20)  # (task_name, assignee, sender)
 
 
 class TaskAction(BaseModel):
@@ -42,10 +43,18 @@ def analyze_message(text: str, sender: str = "") -> dict | None:
     """Returns JSON action or None if irrelevant."""
     today = date.today()
     cal = ", ".join((today + timedelta(days=i)).strftime("%a %Y-%m-%d") for i in range(14))
+    recent_str = ", ".join(
+        f"'{t}' (assignee: {a or 'none'}, by: {s or 'unknown'})" for t, a, s in list(recent_tasks)[-5:]
+    )
+    last_sender_task = next(
+        (t for t, _, s in reversed(recent_tasks) if s == sender),
+        recent_tasks[-1][0] if recent_tasks else None,
+    )
     prompt = (
         f"Today is {today.isoformat()} ({today.strftime('%A')}). "
         f"Message sender: {sender or 'Unknown'}.\n"
         f"Upcoming 14 days: {cal}.\n"
+        f"Recent tasks (oldest -> newest): {recent_str or 'none'}.\n"
         "Extract structured task action from the message:\n"
         "- action:\n"
         "  * 'assign': someone takes or is assigned a task (e.g. '[Name] will [task]', 'I will/can [task]', 'assign [task] to [Name]').\n"
@@ -60,20 +69,28 @@ def analyze_message(text: str, sender: str = "") -> dict | None:
         "each extra 'next' (e.g. 'next next <day>') adds +7 days; "
         "'this week' = upcoming Friday (or Sunday if past Fri); 'next week' = next Monday; "
         "'in N days/weeks' = exact offset from today.\n"
-        "- prerequisite_task: Clean underlying task name only (e.g. if 'after Steven is done eating', prerequisite_task is 'eat'; if 'after reviewing PR', prerequisite_task is 'review PR'). Do NOT include person names or status phrases like 'is done'/'after'.\n"
+        "- prerequisite_task: Clean underlying task name only (e.g. if 'after Steven is done eating', prerequisite_task is 'eat'; if 'after reviewing PR', prerequisite_task is 'review PR'). "
+        f"If the message says 'after'/'afterwards'/'after that' with NO specific task named, use '{last_sender_task or 'null'}'. "
+        "If it says 'after [Person]' (e.g. 'after justin'), use [Person]'s most recent task from Recent tasks above. "
+        "Do NOT include person names or status phrases like 'is done'/'after'.\n"
         f"Message: {text}"
     )
-    res = llm.models.generate_content(
-        model='gemini-3.5-flash-lite',
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=TaskAction,
-            temperature=0,
-        ),
+    cfg = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=TaskAction,
+        temperature=0,
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
-    data = json.loads(res.text)
-    return data if data.get("action") != "ignore" else None
+    last_err = None
+    for model in ("gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-4-hydrogen"):
+        try:
+            res = llm.models.generate_content(model=model, contents=prompt, config=cfg)
+            data = json.loads(res.text)
+            return data if data.get("action") != "ignore" else None
+        except Exception as e:
+            last_err = e
+            print(f"[LLM Fallback] {model} failed ({e}), trying next...")
+    raise last_err
 
 # ================= NOTION DB =================
 
@@ -171,7 +188,7 @@ def sync_flowchart():
         print(f"[Flowchart Error] {e}")
 
 
-def handle_action(data: dict) -> bool:
+def handle_action(data: dict, sender: str = "") -> bool:
     task_name = data.get("task")
     action = data.get("action")
 
@@ -199,6 +216,7 @@ def handle_action(data: dict) -> bool:
                 parent={"database_id": NOTION_DB_ID}, properties=props)
             assigned_str = f" assigned to {data['assignee']}" if data.get('assignee') else ""
             print(f"[Done] Created task: {task_name}{assigned_str}")
+        recent_tasks.append((task_name, data.get("assignee"), sender))
         sync_flowchart()
         return True
 
@@ -241,18 +259,19 @@ if __name__ == "__main__":
             for msg_id, text, sender in get_chat_text(10):      # oldest -> newest
                 if msg_id in seen_ids:
                     continue
-                seen_ids.add(msg_id)
-                if len(seen_ids) > 100:
-                    seen_ids.pop()
 
                 print(f"\n[Incoming message from {sender or 'unknown'}] {text}")
                 if not looks_like_task(text):
+                    seen_ids.add(msg_id)
                     print("[Skip] No task signal")
                     continue
 
                 action_data = analyze_message(text, sender)
+                seen_ids.add(msg_id)
+                if len(seen_ids) > 100:
+                    seen_ids.pop()
                 print(f"[Parsed action] {action_data}")
-                if action_data and handle_action(action_data):
+                if action_data and handle_action(action_data, sender):
                     bot_teams.react(msg_id)
         except Exception as e:
             print(f"Error: {e}")
