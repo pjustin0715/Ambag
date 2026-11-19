@@ -16,7 +16,8 @@ from collections import deque
 from bot_nlp import get_chat_text, looks_like_task, match_task_candidate
 
 import os
-from dotenv import load_dotenv
+from urllib.parse import unquote
+from dotenv import load_dotenv, set_key
 
 load_dotenv()
 
@@ -31,8 +32,8 @@ NOTION_DB_ID = os.getenv("notion_db_id", "...")  # Add this to your .env
 _http = requests.Session()
 llm = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=20000))
 notion = Client(auth=NOTION_TOKEN)
-_DB_INFO = notion.databases.retrieve(NOTION_DB_ID)
-DATA_SOURCE_ID = _DB_INFO["data_sources"][0]["id"]
+_DB_INFO = notion.databases.retrieve(NOTION_DB_ID) if "--setup" not in sys.argv else {}
+DATA_SOURCE_ID = _DB_INFO["data_sources"][0]["id"] if _DB_INFO else ""
 _flowchart_block_id = None
 recent_tasks = deque(maxlen=20)  # (task_name, assignee, sender)
 
@@ -373,8 +374,43 @@ def check_deadlines():
             print(f"[Reminder] Sent for '{title}' ({suffix}) to {first_name}")
 
 
+def run_setup():
+    """Interactive .env setup: parses 'Copy as cURL' from Teams DevTools + prompts for missing keys."""
+    open(".env", "a").close()
+    print("Paste Teams 'Copy as cURL' (messages and/or imgo), then press Enter on a blank line (or just Enter to skip):")
+    lines = []
+    while line := input():
+        lines.append(line)
+    blob = "\n".join(lines)
+
+    updates = {}
+    if m := re.search(r"conversations/([^/?'\"\s]+)", blob):
+        updates["teams_chat_id"] = unquote(m.group(1))
+    if m := re.search(r"authorization:\s*(skype_token\s+[^\r\n'\"]+)", blob, re.I):
+        updates["teams_media_token"] = m.group(1).strip()
+    elif m := re.search(r"(skypetoken_asm=[^\r\n;'\"\s]+)", blob, re.I):
+        updates["teams_media_token"] = m.group(1).strip()
+    elif m := re.search(r"authorization:\s*(?:bearer\s+)?([^\r\n'\"]+)", blob, re.I):
+        updates["teams_token"] = m.group(1).strip()
+    elif m := re.search(r"authentication:\s*(skypetoken=[^\r\n'\"]+)", blob, re.I):
+        updates["teams_token"] = m.group(1).strip()
+
+    for key in ("notion", "notion_db_id", "groq", "openrouter", "gemini"):
+        if not os.getenv(key):
+            if val := input(f"Enter {key} (Enter to skip): ").strip():
+                updates[key] = val
+
+    for k, v in updates.items():
+        set_key(".env", k, v, quote_mode="never")
+        print(f"[Saved] {k}")
+    print("Setup complete." if updates else "Nothing changed.")
+
+
 # ================= LOOP =================
 if __name__ == "__main__":
+    if "--setup" in sys.argv:
+        run_setup()
+        sys.exit(0)
     if "--remind" in sys.argv:
         check_deadlines()
         sys.exit(0)
