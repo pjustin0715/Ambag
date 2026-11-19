@@ -106,8 +106,8 @@ def sync_flowchart():
         tasks = notion.data_sources.query(data_source_id=DATA_SOURCE_ID).get("results", [])
         lines = [
             "flowchart LR",
-            "    classDef done fill:#d4edda,stroke:#28a745,color:#000;",
-            "    classDef todo fill:#fff3cd,stroke:#ffc107,color:#000;",
+            "    classDef done fill:#dcfce7,stroke:#111827,stroke-width:1.5px,color:#111827,rx:8,ry:8;",
+            "    classDef todo fill:#e5e7eb,stroke:#111827,stroke-width:1.5px,color:#111827,rx:8,ry:8;",
         ]
         if not tasks:
             lines.append('    empty["No tasks yet"]')
@@ -118,13 +118,24 @@ def sync_flowchart():
             title = title_list[0]["text"]["content"].replace('"', "'") if title_list else "Untitled"
             if title.lower() == "task flowchart":
                 continue
+
             assignee_list = props.get("Assignee", {}).get("rich_text", [])
-            assignee = assignee_list[0]["text"]["content"].replace('"', "'") if assignee_list else "Unassigned"
+            raw_assignee = assignee_list[0]["text"]["content"].strip() if assignee_list else ""
+            assignee = raw_assignee.split()[0].capitalize() if raw_assignee else "Unassigned"
+
             deadline = (props.get("Deadline", {}).get("date") or {}).get("start", "")
-            done = props.get("Completed", {}).get("checkbox", False)
-            icon, cls = ("✅", "done") if done else ("⏳", "todo")
-            dl_str = f"\\n📅 {deadline}" if deadline else ""
-            lines.append(f'    {nid}["{icon} {title}\\n👤 {assignee}{dl_str}"]:::{cls}')
+            dl_str = ""
+            if deadline:
+                try:
+                    dl_str = date.fromisoformat(deadline[:10]).strftime("%m/%d (%a)")
+                except ValueError:
+                    dl_str = deadline
+
+            cls = "done" if props.get("Completed", {}).get("checkbox", False) else "todo"
+            footer = f"{assignee} - {dl_str}" if dl_str else assignee
+            footer = footer.replace(" ", "\u00a0").replace("-", "\u2011")
+            card = f"<b>&nbsp;&nbsp;{title}&nbsp;&nbsp;</b><br/><hr/>{footer}"
+            lines.append(f'    {nid}["{card}"]:::{cls}')
             for pre in props.get("Prerequisite", {}).get("relation", []):
                 pid = "n" + pre["id"].replace("-", "")
                 lines.append(f"    {pid} --> {nid}")
