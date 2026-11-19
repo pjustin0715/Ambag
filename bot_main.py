@@ -1,5 +1,6 @@
 import time
 import json
+import requests
 from datetime import date, timedelta
 from pydantic import BaseModel
 from google import genai
@@ -17,11 +18,12 @@ load_dotenv()
 
 # ================= CONFIG =================
 GEMINI_API_KEY = os.getenv("gemini")
+OPENROUTER_API_KEY = os.getenv("openrouter") or os.getenv("OPENROUTER_API_KEY")
 NOTION_TOKEN = os.getenv("notion")
 NOTION_DB_ID = os.getenv("notion_db_id", "...")  # Add this to your .env
 
 
-llm = genai.Client(api_key=GEMINI_API_KEY)
+llm = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=20000))
 notion = Client(auth=NOTION_TOKEN)
 _DB_INFO = notion.databases.retrieve(NOTION_DB_ID)
 DATA_SOURCE_ID = _DB_INFO["data_sources"][0]["id"]
@@ -37,6 +39,28 @@ class TaskAction(BaseModel):
     prerequisite_task: str | None
 
 # ================= LLM BRAIN =================
+
+
+def _call_openrouter(prompt: str, model: str) -> dict | None:
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt + '\nReturn ONLY valid JSON: {"action": "create|assign|complete|ignore", "task": str|null, "assignee": str|null, "deadline": str|null, "prerequisite_task": str|null}'}],
+        "temperature": 0,
+    }
+    if model == "openai/gpt-4o-mini":
+        body["response_format"] = {"type": "json_object"}
+    r = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+        json=body,
+        timeout=10,
+    )
+    r.raise_for_status()
+    raw = r.json()["choices"][0]["message"]["content"].strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    data = json.loads(raw)
+    return data if data.get("action") != "ignore" else None
 
 
 def analyze_message(text: str, sender: str = "") -> dict | None:
@@ -67,7 +91,7 @@ def analyze_message(text: str, sender: str = "") -> dict | None:
         "'this <day>' or '<day>' = nearest upcoming <day>; "
         "'next <day>' = <day> in the following calendar week (or +7 days from this <day>); "
         "each extra 'next' (e.g. 'next next <day>') adds +7 days; "
-        "'this week' = upcoming Friday (or Sunday if past Fri); 'next week' = next Monday; "
+        "'this week' = upcoming Friday (or Sunday if past Fri); 'next week' = Friday of next week; "
         "'in N days/weeks' = exact offset from today.\n"
         "- prerequisite_task: Clean underlying task name only (e.g. if 'after Steven is done eating', prerequisite_task is 'eat'; if 'after reviewing PR', prerequisite_task is 'review PR'). "
         f"If the message says 'after'/'afterwards'/'after that' with NO specific task named, use '{last_sender_task or 'null'}'. "
@@ -75,21 +99,40 @@ def analyze_message(text: str, sender: str = "") -> dict | None:
         "Do NOT include person names or status phrases like 'is done'/'after'.\n"
         f"Message: {text}"
     )
-    cfg = types.GenerateContentConfig(
-        response_mime_type="application/json",
-        response_schema=TaskAction,
-        temperature=0,
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-    )
     last_err = None
-    for model in ("gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-4-hydrogen"):
+    if OPENROUTER_API_KEY:
         try:
+            return _call_openrouter(prompt, "openrouter/free")
+        except Exception as e:
+            last_err = e
+            print(f"[LLM Fallback] openrouter/free failed ({e}), trying Gemini...")
+
+    for model, level in (
+        ("gemini-3.5-flash-lite", types.ThinkingLevel.MINIMAL),
+        ("gemini-3.8-flash", types.ThinkingLevel.LOW),
+        ("gemini-4-hydrogen", types.ThinkingLevel.LOW),
+    ):
+        try:
+            cfg = types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=TaskAction,
+                temperature=0,
+                thinking_config=types.ThinkingConfig(thinking_level=level),
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            )
             res = llm.models.generate_content(model=model, contents=prompt, config=cfg)
             data = json.loads(res.text)
             return data if data.get("action") != "ignore" else None
         except Exception as e:
             last_err = e
             print(f"[LLM Fallback] {model} failed ({e}), trying next...")
+
+    if OPENROUTER_API_KEY:
+        try:
+            return _call_openrouter(prompt, "openai/gpt-4o-mini")
+        except Exception as e:
+            last_err = e
+            print(f"[LLM Fallback] openai/gpt-4o-mini failed ({e})")
     raise last_err
 
 # ================= NOTION DB =================
