@@ -1,6 +1,8 @@
+import re
 import sys
 import time
 import json
+import base64
 import requests
 from datetime import date, timedelta
 from pydantic import BaseModel
@@ -46,10 +48,18 @@ class TaskList(BaseModel):
 # ================= LLM BRAIN =================
 
 
-def _call_openrouter(prompt: str, model: str) -> list[dict]:
+def _call_openrouter(prompt: str, model: str, images: list[tuple[bytes, str]] | None = None) -> list[dict]:
+    full_prompt = prompt + '\nReturn ONLY valid JSON: {"actions": [{"action": "create|assign|complete|ignore", "task": str|null, "assignee": str|null, "deadline": str|null, "prerequisite_task": str|null}]}'
+    if images:
+        content = [{"type": "text", "text": full_prompt}] + [
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(b).decode()}"}}
+            for b, mime in images
+        ]
+    else:
+        content = full_prompt
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt + '\nReturn ONLY valid JSON: {"actions": [{"action": "create|assign|complete|ignore", "task": str|null, "assignee": str|null, "deadline": str|null, "prerequisite_task": str|null}]}'}],
+        "messages": [{"role": "user", "content": content}],
         "temperature": 0,
     }
     if model == "openai/gpt-4o-mini":
@@ -58,7 +68,7 @@ def _call_openrouter(prompt: str, model: str) -> list[dict]:
         "https://openrouter.ai/api/v1/chat/completions",
         headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
         json=body,
-        timeout=10,
+        timeout=15 if images else 10,
     )
     r.raise_for_status()
     raw = r.json()["choices"][0]["message"]["content"].strip()
@@ -68,7 +78,7 @@ def _call_openrouter(prompt: str, model: str) -> list[dict]:
     return [a for a in data.get("actions", []) if a.get("action") != "ignore"]
 
 
-def analyze_message(text: str, sender: str = "") -> list[dict]:
+def analyze_message(text: str, sender: str = "", images: list[tuple[bytes, str]] | None = None) -> list[dict]:
     """Returns list of JSON actions (empty if irrelevant)."""
     today = date.today()
     cal = ", ".join((today + timedelta(days=i)).strftime("%a %Y-%m-%d") for i in range(14))
@@ -84,7 +94,7 @@ def analyze_message(text: str, sender: str = "") -> list[dict]:
         f"Message sender: {sender or 'Unknown'}.\n"
         f"Upcoming 14 days: {cal}.\n"
         f"Recent tasks (oldest -> newest): {recent_str or 'none'}.\n"
-        "Extract ALL task actions from the message (split into separate items across lines OR conjunctions like 'and', 'then', 'also', ',', ';'):\n"
+        "Extract ALL task actions from the message and/or any attached whiteboard/notes image (split into separate items across lines OR conjunctions like 'and', 'then', 'also', ',', ';'):\n"
         "- action:\n"
         "  * 'assign': someone takes or is assigned a task (e.g. '[Name] will [task]', 'I will/can [task]', 'assign [task] to [Name]', '[task] - [Name] - [date]').\n"
         "  * 'complete': task is marked finished or done.\n"
@@ -101,20 +111,22 @@ def analyze_message(text: str, sender: str = "") -> list[dict]:
         "- prerequisite_task: Clean underlying task name only (e.g. if 'after Steven is done eating', prerequisite_task is 'eat'; if 'after reviewing PR', prerequisite_task is 'review PR'). "
         f"Sequential/conditional words like 'then', 'once', 'before', 'after', 'afterwards', 'after that' link tasks: in 'A then B' or 'once A is done, B', B's prerequisite_task is A; if no task is named after 'after'/'then', use '{last_sender_task or 'null'}' (or the previous task in this message). "
         "If it says 'after [Person]' (e.g. 'after justin'), use [Person]'s most recent task from Recent tasks above or earlier in this message. "
+        "If tasks are numbered in order (e.g. '1. A', '2. B', '3. C' in text or image), strip the numbers from task names and chain each item's prerequisite_task to the previous numbered task (unless another prerequisite is stated). "
         "Do NOT include person names or status phrases like 'is done'/'after', and NEVER set prerequisite_task to the task itself.\n"
         f"Example: 'I will go to school tomorrow and steven will bring the laptop after' -> 2 items: "
         f"(1) task='go to school', assignee='{sender or 'sender'}', deadline=tomorrow, prerequisite_task=null; "
         "(2) task='bring the laptop', assignee='steven', deadline=null, prerequisite_task='go to school'.\n"
-        f"Message:\n{text}"
+        f"Message:\n{text or '(see attached image)'}"
     )
     last_err = None
     if OPENROUTER_API_KEY:
         try:
-            return _call_openrouter(prompt, "openrouter/free")
+            return _call_openrouter(prompt, "openrouter/free", images)
         except Exception as e:
             last_err = e
             print(f"[LLM Fallback] openrouter/free failed ({e}), trying Gemini...")
 
+    gemini_contents = [prompt, *[types.Part.from_bytes(data=b, mime_type=mime) for b, mime in images]] if images else prompt
     for model, level in (
         ("gemini-3.5-flash-lite", types.ThinkingLevel.MINIMAL),
         ("gemini-3.8-flash", types.ThinkingLevel.LOW),
@@ -128,7 +140,7 @@ def analyze_message(text: str, sender: str = "") -> list[dict]:
                 thinking_config=types.ThinkingConfig(thinking_level=level),
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
             )
-            res = llm.models.generate_content(model=model, contents=prompt, config=cfg)
+            res = llm.models.generate_content(model=model, contents=gemini_contents, config=cfg)
             data = json.loads(res.text)
             return [a for a in data.get("actions", []) if a.get("action") != "ignore"]
         except Exception as e:
@@ -137,7 +149,7 @@ def analyze_message(text: str, sender: str = "") -> list[dict]:
 
     if OPENROUTER_API_KEY:
         try:
-            return _call_openrouter(prompt, "openai/gpt-4o-mini")
+            return _call_openrouter(prompt, "openai/gpt-4o-mini", images)
         except Exception as e:
             last_err = e
             print(f"[LLM Fallback] openai/gpt-4o-mini failed ({e})")
@@ -356,22 +368,27 @@ if __name__ == "__main__":
     seen_ids = set()
 
     # Mark existing history as seen so a restart doesn't re-process old messages
-    for msg_id, _, _ in get_chat_text(10):
+    for msg_id, _, _, _ in get_chat_text(10):
         seen_ids.add(msg_id)
 
     while True:
         try:
-            for msg_id, text, sender in get_chat_text(10):      # oldest -> newest
+            for msg_id, text, sender, img_urls in get_chat_text(10):      # oldest -> newest
                 if msg_id in seen_ids:
                     continue
 
-                print(f"\n[Incoming message from {sender or 'unknown'}] {text}")
-                if not looks_like_task(text):
+                print(f"\n[Incoming message from {sender or 'unknown'}] {text or '(image)'}" + (f" [{len(img_urls)} img]" if img_urls else ""))
+                if not img_urls and not looks_like_task(text):
                     seen_ids.add(msg_id)
                     print("[Skip] No task signal")
                     continue
 
-                actions = analyze_message(text, sender)
+                images = [d for u in img_urls if (d := bot_teams.download_image(u))]
+                actions = analyze_message(text, sender, images)
+                if len(re.findall(r"^\s*\d+[.)]\s+", text, re.M)) >= 2 and len(actions) >= 2:
+                    for i in range(1, len(actions)):
+                        if not actions[i].get("prerequisite_task"):
+                            actions[i]["prerequisite_task"] = actions[i - 1].get("task")
                 seen_ids.add(msg_id)
                 if len(seen_ids) > 100:
                     seen_ids.pop()
