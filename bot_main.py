@@ -1,3 +1,4 @@
+import sys
 import time
 import json
 import requests
@@ -280,14 +281,21 @@ def handle_action(data: dict, sender: str = "", sync: bool = True) -> bool:
                 sync_flowchart()
 
             # Check prerequisites and notify
+            prev_rt = page["properties"].get("Assignee", {}).get("rich_text", [])
+            prev_raw = (prev_rt[0]["text"]["content"].strip() if prev_rt else "") or sender or "Someone"
+            prev_assignee = prev_raw.split()[0].capitalize()
+            prev_title = page["properties"]["Task Name"]["title"][0]["text"]["content"]
+
             deps = notion.data_sources.query(data_source_id=DATA_SOURCE_ID, filter={
                                              "property": "Prerequisite", "relation": {"contains": page["id"]}})
             for dep in deps["results"]:
-                assignee = dep["properties"].get("Assignee", {}).get("rich_text", [{}])[
-                    0].get("text", {}).get("content", "Someone")
+                dep_rt = dep["properties"].get("Assignee", {}).get("rich_text", [])
+                dep_raw = dep_rt[0]["text"]["content"].strip() if dep_rt else "Someone"
+                assignee = dep_raw.split()[0].capitalize()
                 dep_name = dep["properties"]["Task Name"]["title"][0]["text"]["content"]
                 bot_teams.send(
-                    f"🔔 @{assignee}, {task_name} is done. You can start {dep_name}!")
+                    f'@{assignee}, {prev_assignee} has completed the task "{prev_title}". You can start with your task "{dep_name}"'
+                )
                 print(f"[Notification] Reminded {assignee} for {dep_name}")
             return True
         else:
@@ -295,8 +303,54 @@ def handle_action(data: dict, sender: str = "", sync: bool = True) -> bool:
     return False
 
 
+def check_deadlines():
+    """Send @mention reminders for open tasks due in 7 days, 1 day, today, or past due."""
+    today = date.today()
+    open_tasks = notion.data_sources.query(
+        data_source_id=DATA_SOURCE_ID,
+        filter={"property": "Completed", "checkbox": {"equals": False}},
+    ).get("results", [])
+
+    for t in open_tasks:
+        props = t["properties"]
+        deadline = (props.get("Deadline", {}).get("date") or {}).get("start", "")
+        if not deadline:
+            continue
+        try:
+            days_left = (date.fromisoformat(deadline[:10]) - today).days
+        except ValueError:
+            continue
+
+        if days_left == 7:
+            suffix = "is due in 7 days."
+        elif days_left == 1:
+            suffix = "is due tomorrow."
+        elif days_left == 0:
+            suffix = "is due today!"
+        elif days_left < 0:
+            suffix = "is past due!!!"
+        else:
+            continue
+
+        title_list = props.get("Task Name", {}).get("title", [])
+        title = title_list[0]["text"]["content"] if title_list else "Untitled"
+        if title.lower() == "task flowchart":
+            continue
+        assignee_list = props.get("Assignee", {}).get("rich_text", [])
+        assignee = assignee_list[0]["text"]["content"].strip() if assignee_list else "Someone"
+        first_name = assignee.split()[0].capitalize()
+
+        msg = f'@{first_name}, just a reminder, your task "{title}" {suffix}'
+        if bot_teams.send(msg):
+            print(f"[Reminder] Sent for '{title}' ({suffix}) to {first_name}")
+
+
 # ================= LOOP =================
 if __name__ == "__main__":
+    if "--remind" in sys.argv:
+        check_deadlines()
+        sys.exit(0)
+
     print("Bot running... Polling for messages.")
     sync_flowchart()
     seen_ids = set()

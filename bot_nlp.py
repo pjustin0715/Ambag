@@ -60,7 +60,7 @@ def get_chat_text(limit: int = 10) -> list[tuple[str, str, str]]:
     for m in reversed(read(limit)):
         text = clean_teams_text(m.get("content", ""))
         sender = m.get("imdisplayname") or m.get("fromGivenNameInToken") or ""
-        if text and not text.startswith(BOT_PREFIX):
+        if text and not text.startswith(BOT_PREFIX) and "just a reminder, your task" not in text and "You can start with your task" not in text:
             messages.append((m.get("id", ""), text, sender))
     return messages
 
