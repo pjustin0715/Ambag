@@ -28,7 +28,7 @@ TASK_SIGNALS = {
     "do", "will", "assign", "assigned", "done", "finish", "finished",
     "complete", "completed", "after", "before", "until", "deadline", "due",
     "start", "submit", "handle", "take", "taking", "create", "make", "need",
-    "needs", "todo", "task", "can", "review", "work", "working", "i'll",
+    "needs", "todo", "task", "can", "review", "work", "working", "i'll", "then", "once",
 }
 
 DATE_RE = re.compile(
@@ -40,18 +40,19 @@ DATE_RE = re.compile(
 )
 
 def clean_teams_text(raw_text: str) -> str:
-    """Strip HTML tags/entities and normalize whitespace."""
+    """Strip HTML tags/entities and preserve line breaks."""
     if not raw_text:
         return ""
-    text = re.sub(r"<br\s*/?>|</p>|</div>|</li>", " ", raw_text, flags=re.I)
+    text = re.sub(r"<br\s*/?>|</p>|</div>|</li>", "\n", raw_text, flags=re.I)
     text = re.sub(r"<[^>]+>", "", text)
     text = html.unescape(text).replace("\xa0", " ")
-    return re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"[ \t]+", " ", text)
+    return re.sub(r"\n+", "\n", text).strip()
 
 def looks_like_task(text: str) -> bool:
-    """Pre-filter: True if message contains task keywords or dates."""
+    """Pre-filter: True if message contains task keywords, dates, or multi-line dash list."""
     words = set(re.findall(r"[a-z']+", text.lower()))
-    return bool(words & TASK_SIGNALS) or bool(DATE_RE.search(text))
+    return bool(words & TASK_SIGNALS) or bool(DATE_RE.search(text)) or ("\n" in text and " - " in text)
 
 def get_chat_text(limit: int = 10) -> list[tuple[str, str, str]]:
     """Cleaned human messages (oldest -> newest): [(msg_id, text, sender), ...]."""

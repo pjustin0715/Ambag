@@ -38,13 +38,17 @@ class TaskAction(BaseModel):
     deadline: str | None
     prerequisite_task: str | None
 
+
+class TaskList(BaseModel):
+    actions: list[TaskAction]
+
 # ================= LLM BRAIN =================
 
 
-def _call_openrouter(prompt: str, model: str) -> dict | None:
+def _call_openrouter(prompt: str, model: str) -> list[dict]:
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt + '\nReturn ONLY valid JSON: {"action": "create|assign|complete|ignore", "task": str|null, "assignee": str|null, "deadline": str|null, "prerequisite_task": str|null}'}],
+        "messages": [{"role": "user", "content": prompt + '\nReturn ONLY valid JSON: {"actions": [{"action": "create|assign|complete|ignore", "task": str|null, "assignee": str|null, "deadline": str|null, "prerequisite_task": str|null}]}'}],
         "temperature": 0,
     }
     if model == "openai/gpt-4o-mini":
@@ -60,11 +64,11 @@ def _call_openrouter(prompt: str, model: str) -> dict | None:
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
     data = json.loads(raw)
-    return data if data.get("action") != "ignore" else None
+    return [a for a in data.get("actions", []) if a.get("action") != "ignore"]
 
 
-def analyze_message(text: str, sender: str = "") -> dict | None:
-    """Returns JSON action or None if irrelevant."""
+def analyze_message(text: str, sender: str = "") -> list[dict]:
+    """Returns list of JSON actions (empty if irrelevant)."""
     today = date.today()
     cal = ", ".join((today + timedelta(days=i)).strftime("%a %Y-%m-%d") for i in range(14))
     recent_str = ", ".join(
@@ -79,9 +83,9 @@ def analyze_message(text: str, sender: str = "") -> dict | None:
         f"Message sender: {sender or 'Unknown'}.\n"
         f"Upcoming 14 days: {cal}.\n"
         f"Recent tasks (oldest -> newest): {recent_str or 'none'}.\n"
-        "Extract structured task action from the message:\n"
+        "Extract ALL task actions from the message (split into separate items across lines OR conjunctions like 'and', 'then', 'also', ',', ';'):\n"
         "- action:\n"
-        "  * 'assign': someone takes or is assigned a task (e.g. '[Name] will [task]', 'I will/can [task]', 'assign [task] to [Name]').\n"
+        "  * 'assign': someone takes or is assigned a task (e.g. '[Name] will [task]', 'I will/can [task]', 'assign [task] to [Name]', '[task] - [Name] - [date]').\n"
         "  * 'complete': task is marked finished or done.\n"
         "  * 'create': new task is created without assignment.\n"
         "  * 'ignore': no task action.\n"
@@ -94,10 +98,13 @@ def analyze_message(text: str, sender: str = "") -> dict | None:
         "'this week' = upcoming Friday (or Sunday if past Fri); 'next week' = Friday of next week; "
         "'in N days/weeks' = exact offset from today.\n"
         "- prerequisite_task: Clean underlying task name only (e.g. if 'after Steven is done eating', prerequisite_task is 'eat'; if 'after reviewing PR', prerequisite_task is 'review PR'). "
-        f"If the message says 'after'/'afterwards'/'after that' with NO specific task named, use '{last_sender_task or 'null'}'. "
-        "If it says 'after [Person]' (e.g. 'after justin'), use [Person]'s most recent task from Recent tasks above. "
-        "Do NOT include person names or status phrases like 'is done'/'after'.\n"
-        f"Message: {text}"
+        f"Sequential/conditional words like 'then', 'once', 'before', 'after', 'afterwards', 'after that' link tasks: in 'A then B' or 'once A is done, B', B's prerequisite_task is A; if no task is named after 'after'/'then', use '{last_sender_task or 'null'}' (or the previous task in this message). "
+        "If it says 'after [Person]' (e.g. 'after justin'), use [Person]'s most recent task from Recent tasks above or earlier in this message. "
+        "Do NOT include person names or status phrases like 'is done'/'after', and NEVER set prerequisite_task to the task itself.\n"
+        f"Example: 'I will go to school tomorrow and steven will bring the laptop after' -> 2 items: "
+        f"(1) task='go to school', assignee='{sender or 'sender'}', deadline=tomorrow, prerequisite_task=null; "
+        "(2) task='bring the laptop', assignee='steven', deadline=null, prerequisite_task='go to school'.\n"
+        f"Message:\n{text}"
     )
     last_err = None
     if OPENROUTER_API_KEY:
@@ -115,14 +122,14 @@ def analyze_message(text: str, sender: str = "") -> dict | None:
         try:
             cfg = types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=TaskAction,
+                response_schema=TaskList,
                 temperature=0,
                 thinking_config=types.ThinkingConfig(thinking_level=level),
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
             )
             res = llm.models.generate_content(model=model, contents=prompt, config=cfg)
             data = json.loads(res.text)
-            return data if data.get("action") != "ignore" else None
+            return [a for a in data.get("actions", []) if a.get("action") != "ignore"]
         except Exception as e:
             last_err = e
             print(f"[LLM Fallback] {model} failed ({e}), trying next...")
@@ -231,36 +238,36 @@ def sync_flowchart():
         print(f"[Flowchart Error] {e}")
 
 
-def handle_action(data: dict, sender: str = "") -> bool:
+def handle_action(data: dict, sender: str = "", sync: bool = True) -> bool:
     task_name = data.get("task")
     action = data.get("action")
 
     if action in ("create", "assign"):
+        props = {}
+        if data.get("assignee"):
+            props["Assignee"] = {"rich_text": [{"text": {"content": data["assignee"]}}]}
+        if data.get("deadline") and len(data["deadline"]) == 10 and data["deadline"][4] == "-" and data["deadline"][7] == "-":
+            props["Deadline"] = {"date": {"start": data["deadline"]}}
+        if data.get("prerequisite_task") and data["prerequisite_task"].lower() != (task_name or "").lower():
+            prereq = find_task(data["prerequisite_task"])
+            if prereq:
+                props["Prerequisite"] = {"relation": [{"id": prereq["id"]}]}
+
         page = find_task(task_name)
         if page:
-            if not data.get("assignee"):
+            if not props:
                 print(f"[Skip] Task already exists: {task_name}")
                 return False
-            notion.pages.update(page["id"], properties={"Assignee": {
-                                "rich_text": [{"text": {"content": data["assignee"]}}]}})
-            print(f"[Done] Assigned existing task {task_name} to {data['assignee']}")
+            notion.pages.update(page["id"], properties=props)
+            print(f"[Done] Updated task {task_name}: {', '.join(props.keys())}")
         else:
-            # Task does not exist -> create it with assignee if recognized
-            props = {"Task Name": {"title": [{"text": {"content": task_name}}]}}
-            if data.get("assignee"):
-                props["Assignee"] = {"rich_text": [{"text": {"content": data["assignee"]}}]}
-            if data.get("deadline") and len(data["deadline"]) == 10 and data["deadline"][4] == "-" and data["deadline"][7] == "-":
-                props["Deadline"] = {"date": {"start": data["deadline"]}}
-            if data.get("prerequisite_task"):
-                prereq = find_task(data["prerequisite_task"])
-                if prereq:
-                    props["Prerequisite"] = {"relation": [{"id": prereq["id"]}]}
-            notion.pages.create(
-                parent={"database_id": NOTION_DB_ID}, properties=props)
+            props["Task Name"] = {"title": [{"text": {"content": task_name}}]}
+            notion.pages.create(parent={"database_id": NOTION_DB_ID}, properties=props)
             assigned_str = f" assigned to {data['assignee']}" if data.get('assignee') else ""
             print(f"[Done] Created task: {task_name}{assigned_str}")
         recent_tasks.append((task_name, data.get("assignee"), sender))
-        sync_flowchart()
+        if sync:
+            sync_flowchart()
         return True
 
     elif action == "complete":
@@ -269,7 +276,8 @@ def handle_action(data: dict, sender: str = "") -> bool:
             notion.pages.update(page["id"], properties={
                                 "Completed": {"checkbox": True}})
             print(f"[Done] Completed task: {task_name}")
-            sync_flowchart()
+            if sync:
+                sync_flowchart()
 
             # Check prerequisites and notify
             deps = notion.data_sources.query(data_source_id=DATA_SOURCE_ID, filter={
@@ -309,12 +317,13 @@ if __name__ == "__main__":
                     print("[Skip] No task signal")
                     continue
 
-                action_data = analyze_message(text, sender)
+                actions = analyze_message(text, sender)
                 seen_ids.add(msg_id)
                 if len(seen_ids) > 100:
                     seen_ids.pop()
-                print(f"[Parsed action] {action_data}")
-                if action_data and handle_action(action_data, sender):
+                print(f"[Parsed actions] {actions}")
+                if any([handle_action(a, sender, sync=False) for a in actions]):
+                    sync_flowchart()
                     bot_teams.react(msg_id)
         except Exception as e:
             print(f"Error: {e}")
