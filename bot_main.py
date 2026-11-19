@@ -1,6 +1,6 @@
 import time
 import json
-from datetime import date
+from datetime import date, timedelta
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
@@ -40,9 +40,12 @@ class TaskAction(BaseModel):
 
 def analyze_message(text: str, sender: str = "") -> dict | None:
     """Returns JSON action or None if irrelevant."""
+    today = date.today()
+    cal = ", ".join((today + timedelta(days=i)).strftime("%a %Y-%m-%d") for i in range(14))
     prompt = (
-        f"Today is {date.today().isoformat()} ({date.today().strftime('%A')}). "
+        f"Today is {today.isoformat()} ({today.strftime('%A')}). "
         f"Message sender: {sender or 'Unknown'}.\n"
+        f"Upcoming 14 days: {cal}.\n"
         "Extract structured task action from the message:\n"
         "- action:\n"
         "  * 'assign': someone takes or is assigned a task (e.g. '[Name] will [task]', 'I will/can [task]', 'assign [task] to [Name]').\n"
@@ -51,7 +54,12 @@ def analyze_message(text: str, sender: str = "") -> dict | None:
         "  * 'ignore': no task action.\n"
         f"- assignee: Person assigned. If first-person ('I', 'me', 'myself'), use sender '{sender}'. Only set if explicitly stated, else null.\n"
         "- task: The task name.\n"
-        "- deadline: ISO 8601 (YYYY-MM-DD) or null.\n"
+        "- deadline: ISO 8601 (YYYY-MM-DD) or null. Resolve relative phrases using the calendar above: "
+        "'this <day>' or '<day>' = nearest upcoming <day>; "
+        "'next <day>' = <day> in the following calendar week (or +7 days from this <day>); "
+        "each extra 'next' (e.g. 'next next <day>') adds +7 days; "
+        "'this week' = upcoming Friday (or Sunday if past Fri); 'next week' = next Monday; "
+        "'in N days/weeks' = exact offset from today.\n"
         "- prerequisite_task: Clean underlying task name only (e.g. if 'after Steven is done eating', prerequisite_task is 'eat'; if 'after reviewing PR', prerequisite_task is 'review PR'). Do NOT include person names or status phrases like 'is done'/'after'.\n"
         f"Message: {text}"
     )
@@ -152,7 +160,7 @@ def sync_flowchart():
         print(f"[Flowchart Error] {e}")
 
 
-def handle_action(data: dict):
+def handle_action(data: dict) -> bool:
     task_name = data.get("task")
     action = data.get("action")
 
@@ -161,7 +169,7 @@ def handle_action(data: dict):
         if page:
             if not data.get("assignee"):
                 print(f"[Skip] Task already exists: {task_name}")
-                return
+                return False
             notion.pages.update(page["id"], properties={"Assignee": {
                                 "rich_text": [{"text": {"content": data["assignee"]}}]}})
             print(f"[Done] Assigned existing task {task_name} to {data['assignee']}")
@@ -181,6 +189,7 @@ def handle_action(data: dict):
             assigned_str = f" assigned to {data['assignee']}" if data.get('assignee') else ""
             print(f"[Done] Created task: {task_name}{assigned_str}")
         sync_flowchart()
+        return True
 
     elif action == "complete":
         page = find_task(task_name)
@@ -200,8 +209,10 @@ def handle_action(data: dict):
                 bot_teams.send(
                     f"🔔 @{assignee}, {task_name} is done. You can start {dep_name}!")
                 print(f"[Notification] Reminded {assignee} for {dep_name}")
+            return True
         else:
             print(f"[Skip] Task not found to complete: {task_name}")
+    return False
 
 
 # ================= LOOP =================
@@ -230,8 +241,8 @@ if __name__ == "__main__":
 
                 action_data = analyze_message(text, sender)
                 print(f"[Parsed action] {action_data}")
-                if action_data:
-                    handle_action(action_data)
+                if action_data and handle_action(action_data):
+                    bot_teams.react(msg_id)
         except Exception as e:
             print(f"Error: {e}")
 

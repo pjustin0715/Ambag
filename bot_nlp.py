@@ -33,9 +33,9 @@ TASK_SIGNALS = {
 
 DATE_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}|"
-    r"\b(mon|tues|wednes|thurs|fri|satur|sun)day\b|"
+    r"\b(mon|tues?|wed(nes)?|thu(rs)?|fri|sat(ur)?|sun)(day)?\b|"
     r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b|"
-    r"\b(today|tomorrow|tonight)\b",
+    r"\b(today|tomorrow|tonight|this week|next week|weekend|in \d+ (day|week|month)s?)\b",
     re.I,
 )
 
@@ -85,9 +85,9 @@ def task_similarity(a: str, b: str) -> float:
     # Reward complete containment (e.g., 'eat' inside 'steven is done eating')
     containment = (inter / min(len(t_a), len(t_b))) * 0.85 if inter == min(len(t_a), len(t_b)) else 0.0
     seq = difflib.SequenceMatcher(None, " ".join(sorted(t_a)), " ".join(sorted(t_b))).ratio()
-    return max(jaccard, seq, containment)
+    return max(jaccard, containment, seq if seq >= 0.85 else 0.0)
 
-def match_task_candidate(target_name: str, candidates: list[dict], threshold: float = 0.6) -> dict | None:
+def match_task_candidate(target_name: str, candidates: list[dict], threshold: float = 0.75) -> dict | None:
     """Finds the best matching Notion page from candidates."""
     best_page, best_score = None, 0.0
     for page in candidates:

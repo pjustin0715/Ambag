@@ -23,6 +23,15 @@ def send(text: str) -> bool:
     }
     return requests.post(URL, headers=HEADERS, json=payload).status_code in (200, 201)
 
+def react(msg_id: str, key: str = "2705_whiteheavycheckmark") -> bool:
+    """Add an emoji reaction to a Teams message via chatsvc."""
+    url = f"{URL}/{msg_id}/properties?name=emotions"
+    payload = {"emotions": {"key": key, "value": int(time.time() * 1000)}}
+    res = requests.put(url, headers=HEADERS, json=payload, timeout=15)
+    if not res.ok:
+        print(f"[React Error] HTTP {res.status_code}: {res.text[:120]}")
+    return res.ok
+
 def read(limit: int = 1) -> list[dict]:
     res = requests.get(f"{URL}?pageSize={limit}", headers=HEADERS, timeout=15)
     if not res.ok:
