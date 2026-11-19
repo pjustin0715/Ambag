@@ -28,39 +28,44 @@ TASK_SIGNALS = {
     "do", "will", "assign", "assigned", "done", "finish", "finished",
     "complete", "completed", "after", "before", "until", "deadline", "due",
     "start", "submit", "handle", "take", "taking", "create", "make", "need",
-    "needs", "todo", "task", "can", "review", "work", "working", "i'll",
+    "needs", "todo", "task", "can", "review", "work", "working", "i'll", "then", "once",
+    "have", "has", "i've", "we've", "already", "just", "went", "gone", "did", "sent",
+    "submitted", "pushed", "merged", "reviewed", "drafted", "wrote", "written",
 }
 
 DATE_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}|"
-    r"\b(mon|tues|wednes|thurs|fri|satur|sun)day\b|"
+    r"\b(mon|tues?|wed(nes)?|thu(rs)?|fri|sat(ur)?|sun)(day)?\b|"
     r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b|"
-    r"\b(today|tomorrow|tonight)\b",
+    r"\b(today|tomorrow|tonight|this week|next week|weekend|in \d+ (day|week|month)s?)\b",
     re.I,
 )
 
 def clean_teams_text(raw_text: str) -> str:
-    """Strip HTML tags/entities and normalize whitespace."""
+    """Strip HTML tags/entities and preserve line breaks."""
     if not raw_text:
         return ""
-    text = re.sub(r"<br\s*/?>|</p>|</div>|</li>", " ", raw_text, flags=re.I)
+    text = re.sub(r"<br\s*/?>|</p>|</div>|</li>", "\n", raw_text, flags=re.I)
     text = re.sub(r"<[^>]+>", "", text)
     text = html.unescape(text).replace("\xa0", " ")
-    return re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"[ \t]+", " ", text)
+    return re.sub(r"\n+", "\n", text).strip()
 
 def looks_like_task(text: str) -> bool:
-    """Pre-filter: True if message contains task keywords or dates."""
+    """Pre-filter: True if message contains task keywords, dates, numbered list, or multi-line dash list."""
     words = set(re.findall(r"[a-z']+", text.lower()))
-    return bool(words & TASK_SIGNALS) or bool(DATE_RE.search(text))
+    return bool(words & TASK_SIGNALS) or bool(DATE_RE.search(text)) or ("\n" in text and " - " in text) or bool(re.search(r"^\s*\d+[.)]\s+\w+", text, re.M))
 
-def get_chat_text(limit: int = 10) -> list[tuple[str, str, str]]:
-    """Cleaned human messages (oldest -> newest): [(msg_id, text, sender), ...]."""
+def get_chat_text(limit: int = 10) -> list[tuple[str, str, str, list[str]]]:
+    """Cleaned human messages (oldest -> newest): [(msg_id, text, sender, img_urls), ...]."""
     messages = []
     for m in reversed(read(limit)):
-        text = clean_teams_text(m.get("content", ""))
+        raw = m.get("content", "")
+        imgs = [u for u in re.findall(r'<img[^>]+src="([^"]+)"', raw, flags=re.I) if "emoticon" not in u.lower() and "emoji" not in u.lower()]
+        text = clean_teams_text(raw)
         sender = m.get("imdisplayname") or m.get("fromGivenNameInToken") or ""
-        if text and not text.startswith(BOT_PREFIX):
-            messages.append((m.get("id", ""), text, sender))
+        if (text or imgs) and not text.startswith(BOT_PREFIX) and "just a reminder, your task" not in text and "You can start with your task" not in text:
+            messages.append((m.get("id", ""), text, sender, imgs))
     return messages
 
 def normalize_tokens(text: str) -> set[str]:
@@ -85,9 +90,9 @@ def task_similarity(a: str, b: str) -> float:
     # Reward complete containment (e.g., 'eat' inside 'steven is done eating')
     containment = (inter / min(len(t_a), len(t_b))) * 0.85 if inter == min(len(t_a), len(t_b)) else 0.0
     seq = difflib.SequenceMatcher(None, " ".join(sorted(t_a)), " ".join(sorted(t_b))).ratio()
-    return max(jaccard, seq, containment)
+    return max(jaccard, containment, seq if seq >= 0.85 else 0.0)
 
-def match_task_candidate(target_name: str, candidates: list[dict], threshold: float = 0.6) -> dict | None:
+def match_task_candidate(target_name: str, candidates: list[dict], threshold: float = 0.75) -> dict | None:
     """Finds the best matching Notion page from candidates."""
     best_page, best_score = None, 0.0
     for page in candidates:
