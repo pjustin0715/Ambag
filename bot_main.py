@@ -23,8 +23,9 @@ NOTION_DB_ID = os.getenv("notion_db_id", "...")  # Add this to your .env
 
 llm = genai.Client(api_key=GEMINI_API_KEY)
 notion = Client(auth=NOTION_TOKEN)
-DATA_SOURCE_ID = notion.databases.retrieve(
-    NOTION_DB_ID)["data_sources"][0]["id"]
+_DB_INFO = notion.databases.retrieve(NOTION_DB_ID)
+DATA_SOURCE_ID = _DB_INFO["data_sources"][0]["id"]
+_flowchart_block_id = None
 
 
 class TaskAction(BaseModel):
@@ -90,6 +91,67 @@ def find_task(name: str):
     return match_task_candidate(name, all_tasks.get("results", []))
 
 
+def sync_flowchart():
+    """Renders all Notion tasks + prerequisites into a native Notion Mermaid block."""
+    global _flowchart_block_id
+    try:
+        tasks = notion.data_sources.query(data_source_id=DATA_SOURCE_ID).get("results", [])
+        lines = [
+            "flowchart LR",
+            "    classDef done fill:#d4edda,stroke:#28a745,color:#000;",
+            "    classDef todo fill:#fff3cd,stroke:#ffc107,color:#000;",
+        ]
+        if not tasks:
+            lines.append('    empty["No tasks yet"]')
+        for t in tasks:
+            nid = "n" + t["id"].replace("-", "")
+            props = t["properties"]
+            title_list = props.get("Task Name", {}).get("title", [])
+            title = title_list[0]["text"]["content"].replace('"', "'") if title_list else "Untitled"
+            if title.lower() == "task flowchart":
+                continue
+            assignee_list = props.get("Assignee", {}).get("rich_text", [])
+            assignee = assignee_list[0]["text"]["content"].replace('"', "'") if assignee_list else "Unassigned"
+            deadline = (props.get("Deadline", {}).get("date") or {}).get("start", "")
+            done = props.get("Completed", {}).get("checkbox", False)
+            icon, cls = ("✅", "done") if done else ("⏳", "todo")
+            dl_str = f"\\n📅 {deadline}" if deadline else ""
+            lines.append(f'    {nid}["{icon} {title}\\n👤 {assignee}{dl_str}"]:::{cls}')
+            for pre in props.get("Prerequisite", {}).get("relation", []):
+                pid = "n" + pre["id"].replace("-", "")
+                lines.append(f"    {pid} --> {nid}")
+
+        body = {"language": "mermaid", "rich_text": [{"type": "text", "text": {"content": "\n".join(lines)}}]}
+
+        if not _flowchart_block_id:
+            page_id = os.getenv("notion_flowchart_id", "").strip()
+            if not page_id:
+                res = notion.search(query="Task Flowchart").get("results", [])
+                pages = [r for r in res if r.get("object") == "page"]
+                page_id = pages[0]["id"] if pages else _DB_INFO.get("parent", {}).get("page_id")
+            if not page_id:
+                print("[Skip] Flowchart: create a Notion page 'Task Flowchart' (shared with integration) or set notion_flowchart_id in .env")
+                return
+
+            for b in notion.blocks.children.list(block_id=page_id).get("results", []):
+                if b.get("type") == "code" and b.get("code", {}).get("language") == "mermaid":
+                    _flowchart_block_id = b["id"]
+                    break
+            if not _flowchart_block_id:
+                created = notion.blocks.children.append(
+                    block_id=page_id,
+                    children=[{"object": "block", "type": "code", "code": body}],
+                )
+                _flowchart_block_id = created["results"][0]["id"]
+                print("[Done] Created Mermaid flowchart in Notion")
+                return
+
+        notion.blocks.update(block_id=_flowchart_block_id, code=body)
+        print("[Done] Synced Notion flowchart")
+    except Exception as e:
+        print(f"[Flowchart Error] {e}")
+
+
 def handle_action(data: dict):
     task_name = data.get("task")
     action = data.get("action")
@@ -97,28 +159,28 @@ def handle_action(data: dict):
     if action in ("create", "assign"):
         page = find_task(task_name)
         if page:
-            if data.get("assignee"):
-                notion.pages.update(page["id"], properties={"Assignee": {
-                                    "rich_text": [{"text": {"content": data["assignee"]}}]}})
-                print(f"[Done] Assigned existing task {task_name} to {data['assignee']}")
-            else:
+            if not data.get("assignee"):
                 print(f"[Skip] Task already exists: {task_name}")
-            return
-
-        # Task does not exist -> create it with assignee if recognized
-        props = {"Task Name": {"title": [{"text": {"content": task_name}}]}}
-        if data.get("assignee"):
-            props["Assignee"] = {"rich_text": [{"text": {"content": data["assignee"]}}]}
-        if data.get("deadline") and len(data["deadline"]) == 10 and data["deadline"][4] == "-" and data["deadline"][7] == "-":
-            props["Deadline"] = {"date": {"start": data["deadline"]}}
-        if data.get("prerequisite_task"):
-            prereq = find_task(data["prerequisite_task"])
-            if prereq:
-                props["Prerequisite"] = {"relation": [{"id": prereq["id"]}]}
-        notion.pages.create(
-            parent={"database_id": NOTION_DB_ID}, properties=props)
-        assigned_str = f" assigned to {data['assignee']}" if data.get('assignee') else ""
-        print(f"[Done] Created task: {task_name}{assigned_str}")
+                return
+            notion.pages.update(page["id"], properties={"Assignee": {
+                                "rich_text": [{"text": {"content": data["assignee"]}}]}})
+            print(f"[Done] Assigned existing task {task_name} to {data['assignee']}")
+        else:
+            # Task does not exist -> create it with assignee if recognized
+            props = {"Task Name": {"title": [{"text": {"content": task_name}}]}}
+            if data.get("assignee"):
+                props["Assignee"] = {"rich_text": [{"text": {"content": data["assignee"]}}]}
+            if data.get("deadline") and len(data["deadline"]) == 10 and data["deadline"][4] == "-" and data["deadline"][7] == "-":
+                props["Deadline"] = {"date": {"start": data["deadline"]}}
+            if data.get("prerequisite_task"):
+                prereq = find_task(data["prerequisite_task"])
+                if prereq:
+                    props["Prerequisite"] = {"relation": [{"id": prereq["id"]}]}
+            notion.pages.create(
+                parent={"database_id": NOTION_DB_ID}, properties=props)
+            assigned_str = f" assigned to {data['assignee']}" if data.get('assignee') else ""
+            print(f"[Done] Created task: {task_name}{assigned_str}")
+        sync_flowchart()
 
     elif action == "complete":
         page = find_task(task_name)
@@ -126,6 +188,7 @@ def handle_action(data: dict):
             notion.pages.update(page["id"], properties={
                                 "Completed": {"checkbox": True}})
             print(f"[Done] Completed task: {task_name}")
+            sync_flowchart()
 
             # Check prerequisites and notify
             deps = notion.data_sources.query(data_source_id=DATA_SOURCE_ID, filter={
@@ -144,6 +207,7 @@ def handle_action(data: dict):
 # ================= LOOP =================
 if __name__ == "__main__":
     print("Bot running... Polling for messages.")
+    sync_flowchart()
     seen_ids = set()
 
     # Mark existing history as seen so a restart doesn't re-process old messages
