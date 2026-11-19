@@ -29,6 +29,8 @@ TASK_SIGNALS = {
     "complete", "completed", "after", "before", "until", "deadline", "due",
     "start", "submit", "handle", "take", "taking", "create", "make", "need",
     "needs", "todo", "task", "can", "review", "work", "working", "i'll", "then", "once",
+    "have", "has", "i've", "we've", "already", "just", "went", "gone", "did", "sent",
+    "submitted", "pushed", "merged", "reviewed", "drafted", "wrote", "written",
 }
 
 DATE_RE = re.compile(

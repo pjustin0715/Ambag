@@ -3,6 +3,7 @@ import sys
 import time
 import json
 import base64
+import threading
 import requests
 from datetime import date, timedelta
 from pydantic import BaseModel
@@ -21,11 +22,13 @@ load_dotenv()
 
 # ================= CONFIG =================
 GEMINI_API_KEY = os.getenv("gemini")
+GROQ_API_KEY = os.getenv("groq") or os.getenv("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.getenv("openrouter") or os.getenv("OPENROUTER_API_KEY")
 NOTION_TOKEN = os.getenv("notion")
 NOTION_DB_ID = os.getenv("notion_db_id", "...")  # Add this to your .env
 
 
+_http = requests.Session()
 llm = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=20000))
 notion = Client(auth=NOTION_TOKEN)
 _DB_INFO = notion.databases.retrieve(NOTION_DB_ID)
@@ -48,7 +51,7 @@ class TaskList(BaseModel):
 # ================= LLM BRAIN =================
 
 
-def _call_openrouter(prompt: str, model: str, images: list[tuple[bytes, str]] | None = None) -> list[dict]:
+def _call_openai_compat(prompt: str, url: str, api_key: str, model: str, images: list[tuple[bytes, str]] | None = None) -> list[dict]:
     full_prompt = prompt + '\nReturn ONLY valid JSON: {"actions": [{"action": "create|assign|complete|ignore", "task": str|null, "assignee": str|null, "deadline": str|null, "prerequisite_task": str|null}]}'
     if images:
         content = [{"type": "text", "text": full_prompt}] + [
@@ -61,16 +64,20 @@ def _call_openrouter(prompt: str, model: str, images: list[tuple[bytes, str]] | 
         "model": model,
         "messages": [{"role": "user", "content": content}],
         "temperature": 0,
+        "max_tokens": 1024,
     }
+    if "openrouter.ai" in url and model == "openrouter/free":
+        body["reasoning"] = {"enabled": False}
     if model == "openai/gpt-4o-mini":
         body["response_format"] = {"type": "json_object"}
-    r = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+    r = _http.post(
+        url,
+        headers={"Authorization": f"Bearer {api_key}"},
         json=body,
         timeout=15 if images else 10,
     )
-    r.raise_for_status()
+    if not r.ok:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
     raw = r.json()["choices"][0]["message"]["content"].strip()
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
@@ -97,7 +104,7 @@ def analyze_message(text: str, sender: str = "", images: list[tuple[bytes, str]]
         "Extract ALL task actions from the message and/or any attached whiteboard/notes image (split into separate items across lines OR conjunctions like 'and', 'then', 'also', ',', ';'):\n"
         "- action:\n"
         "  * 'assign': someone takes or is assigned a task (e.g. '[Name] will [task]', 'I will/can [task]', 'assign [task] to [Name]', '[task] - [Name] - [date]').\n"
-        "  * 'complete': task is marked finished or done.\n"
+        "  * 'complete': task is finished, done, or stated in past/present-perfect tense as already performed (e.g. 'I have gone to class', 'went to school', 'already reviewed the PR', 'pushed the changes').\n"
         "  * 'create': new task is created without assignment.\n"
         "  * 'ignore': no task action.\n"
         f"- assignee: Person assigned. If first-person ('I', 'me', 'myself'), use sender '{sender}'. Only set if explicitly stated, else null.\n"
@@ -119,9 +126,18 @@ def analyze_message(text: str, sender: str = "", images: list[tuple[bytes, str]]
         f"Message:\n{text or '(see attached image)'}"
     )
     last_err = None
+    if GROQ_API_KEY:
+        groq_models = ("qwen/qwen3.8-27b",) if images else ("openai/gpt-oss-20b", "qwen/qwen3.8-27b")
+        for g_model in groq_models:
+            try:
+                return _call_openai_compat(prompt, "https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY, g_model, images)
+            except Exception as e:
+                last_err = e
+                print(f"[LLM Fallback] Groq ({g_model}) failed ({e}), trying next...")
+
     if OPENROUTER_API_KEY:
         try:
-            return _call_openrouter(prompt, "openrouter/free", images)
+            return _call_openai_compat(prompt, "https://openrouter.ai/api/v1/chat/completions", OPENROUTER_API_KEY, "openrouter/free", images)
         except Exception as e:
             last_err = e
             print(f"[LLM Fallback] openrouter/free failed ({e}), trying Gemini...")
@@ -149,7 +165,7 @@ def analyze_message(text: str, sender: str = "", images: list[tuple[bytes, str]]
 
     if OPENROUTER_API_KEY:
         try:
-            return _call_openrouter(prompt, "openai/gpt-4o-mini", images)
+            return _call_openai_compat(prompt, "https://openrouter.ai/api/v1/chat/completions", OPENROUTER_API_KEY, "openai/gpt-4o-mini", images)
         except Exception as e:
             last_err = e
             print(f"[LLM Fallback] openai/gpt-4o-mini failed ({e})")
@@ -394,7 +410,7 @@ if __name__ == "__main__":
                     seen_ids.pop()
                 print(f"[Parsed actions] {actions}")
                 if any([handle_action(a, sender, sync=False) for a in actions]):
-                    sync_flowchart()
+                    threading.Thread(target=sync_flowchart, daemon=True).start()
                     bot_teams.react(msg_id)
         except Exception as e:
             print(f"Error: {e}")
