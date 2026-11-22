@@ -33,14 +33,24 @@ def list_group_chats(limit: int = 30) -> list[tuple[str, str]]:
     return chats
 
 # ponytail: minimal payload; Teams only strictly requires content, type, and a unique client ID
-def send(text: str, chat_id: str | None = None) -> bool:
+def send(text: str, chat_id: str | None = None) -> str | None:
+    client_id = str(int(time.time() * 1000))
     payload = {
         "content": f"<p>{text}</p>",
         "messagetype": "RichText/Html",
         "contenttype": "Text",
-        "clientmessageid": str(int(time.time() * 1000)),
+        "clientmessageid": client_id,
     }
-    return _http.post(_msg_url(chat_id), headers=HEADERS, json=payload, timeout=15).status_code in (200, 201)
+    ok = _http.post(_msg_url(chat_id), headers=HEADERS, json=payload, timeout=15).status_code in (200, 201)
+    return client_id if ok else None
+
+def has_thumbs_up(client_msg_id: str, chat_id: str | None = None) -> bool:
+    """Return True if anyone reacted 👍 ('like') to our message matching client_msg_id."""
+    for m in read(15, chat_id=chat_id):
+        if m.get("clientmessageid") == client_msg_id or m.get("id") == client_msg_id:
+            emotions = (m.get("properties") or {}).get("emotions") or []
+            return any(e.get("key") in ("like", "👍", "1f44d_thumbsup") and e.get("users") for e in emotions)
+    return False
 
 def react(msg_id: str, key: str = "2705_whiteheavycheckmark", chat_id: str | None = None) -> bool:
     """Add an emoji reaction to a Teams message via chatsvc."""

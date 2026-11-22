@@ -64,7 +64,7 @@ def get_chat_text(limit: int = 10, chat_id: str | None = None) -> list[tuple[str
         imgs = [u for u in re.findall(r'<img[^>]+src="([^"]+)"', raw, flags=re.I) if "emoticon" not in u.lower() and "emoji" not in u.lower()]
         text = clean_teams_text(raw)
         sender = m.get("imdisplayname") or m.get("fromGivenNameInToken") or ""
-        if (text or imgs) and not text.startswith(BOT_PREFIX) and "just a reminder, your task" not in text and "You can start with your task" not in text and "Your task tracker & flowchart is ready:" not in text:
+        if (text or imgs) and not text.startswith(BOT_PREFIX) and "just a reminder, your task" not in text and "You can start with your task" not in text and "Your task tracker & flowchart is ready:" not in text and "that image was a bit hard to read!" not in text and "couldn't quite make out the writing" not in text:
             messages.append((m.get("id", ""), text, sender, imgs))
     return messages
 

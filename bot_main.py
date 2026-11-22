@@ -28,6 +28,7 @@ OPENROUTER_API_KEY = os.getenv("openrouter") or os.getenv("OPENROUTER_API_KEY")
 NOTION_TOKEN = os.getenv("notion")
 NOTION_DB_ID = os.getenv("notion_db_id", "").strip()
 NOTION_ROOT_PAGE_ID = os.getenv("notion_root_page_id", "").strip()
+OCR_CONFIDENCE_THRESHOLD = float(os.getenv("ocr_threshold", "0.90"))  # Raise to 0.95 for stricter confirmation, or 1.01 to always confirm images
 CHATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chats.json")
 
 
@@ -123,12 +124,13 @@ class TaskAction(BaseModel):
 
 class TaskList(BaseModel):
     actions: list[TaskAction]
+    ocr_confidence: float = 1.0
 
 # ================= LLM BRAIN =================
 
 
-def _call_openai_compat(prompt: str, url: str, api_key: str, model: str, images: list[tuple[bytes, str]] | None = None) -> list[dict]:
-    full_prompt = prompt + '\nReturn ONLY valid JSON: {"actions": [{"action": "create|assign|complete|ignore", "task": str|null, "assignee": str|null, "deadline": str|null, "prerequisite_task": str|null}]}'
+def _call_openai_compat(prompt: str, url: str, api_key: str, model: str, images: list[tuple[bytes, str]] | None = None) -> tuple[list[dict], float]:
+    full_prompt = prompt + '\nReturn ONLY valid JSON: {"ocr_confidence": float, "actions": [{"action": "create|assign|complete|ignore", "task": str|null, "assignee": str|null, "deadline": str|null, "prerequisite_task": str|null}]}'
     if images:
         content = [{"type": "text", "text": full_prompt}] + [
             {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(b).decode()}"}}
@@ -158,11 +160,13 @@ def _call_openai_compat(prompt: str, url: str, api_key: str, model: str, images:
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
     data = json.loads(raw)
-    return [a for a in data.get("actions", []) if a.get("action") != "ignore"]
+    actions = [a for a in data.get("actions", []) if a.get("action") != "ignore"]
+    conf = float(data.get("ocr_confidence", 1.0)) if images else 1.0
+    return actions, conf
 
 
-def analyze_message(text: str, sender: str = "", images: list[tuple[bytes, str]] | None = None, chat_id: str | None = None) -> list[dict]:
-    """Returns list of JSON actions (empty if irrelevant)."""
+def analyze_message(text: str, sender: str = "", images: list[tuple[bytes, str]] | None = None, chat_id: str | None = None) -> tuple[list[dict], float]:
+    """Returns (actions, ocr_confidence)."""
     today = date.today()
     cal = ", ".join((today + timedelta(days=i)).strftime("%a %Y-%m-%d") for i in range(14))
     recent = _get_recent(chat_id or bot_teams.CHAT_ID)
@@ -179,6 +183,7 @@ def analyze_message(text: str, sender: str = "", images: list[tuple[bytes, str]]
         f"Upcoming 14 days: {cal}.\n"
         f"Recent tasks (oldest -> newest): {recent_str or 'none'}.\n"
         "Extract ALL task actions from the message and/or any attached whiteboard/notes image (split into separate items across lines OR conjunctions like 'and', 'then', 'also', ',', ';'):\n"
+        "- ocr_confidence: float 0.0-1.0 for attached images (1.0 if no image). Be strict: 0.95-1.0 ONLY for crisp typed/printed text; 0.75-0.89 for clear handwriting; 0.50-0.74 for messy/blurry/skewed handwriting; <0.50 if mostly illegible. Lower the score if ANY word, name, or date had to be guessed.\n"
         "- action:\n"
         "  * 'assign': someone takes or is assigned a task (e.g. '[Name] will [task]', 'I will/can [task]', 'assign [task] to [Name]', '[task] - [Name] - [date]').\n"
         "  * 'complete': task is finished, done, or stated in past/present-perfect tense as already performed (e.g. 'I have gone to class', 'went to school', 'already reviewed the PR', 'pushed the changes').\n"
@@ -235,7 +240,9 @@ def analyze_message(text: str, sender: str = "", images: list[tuple[bytes, str]]
             )
             res = llm.models.generate_content(model=model, contents=gemini_contents, config=cfg)
             data = json.loads(res.text)
-            return [a for a in data.get("actions", []) if a.get("action") != "ignore"]
+            actions = [a for a in data.get("actions", []) if a.get("action") != "ignore"]
+            conf = float(data.get("ocr_confidence", 1.0)) if images else 1.0
+            return actions, conf
         except Exception as e:
             last_err = e
             print(f"[LLM Fallback] {model} failed ({e}), trying next...")
@@ -515,6 +522,7 @@ if __name__ == "__main__":
     print("Bot running... Polling for messages.")
     chats = load_chats()
     seen_ids = set()
+    pending_confirm: dict[str, dict] = {}  # chat_id -> pending low-confidence OCR actions
 
     # On startup, ignore pre-existing group chats not in chats.json so we don't spam old chats
     if NOTION_ROOT_PAGE_ID:
@@ -556,6 +564,15 @@ if __name__ == "__main__":
             for cid, cfg in list(chats.items()):
                 if cfg.get("ignored"):
                     continue
+
+                # Check if a pending low-confidence OCR confirmation received 👍
+                if cid in pending_confirm and bot_teams.has_thumbs_up(pending_confirm[cid]["client_msg_id"], chat_id=cid):
+                    pend = pending_confirm.pop(cid)
+                    print(f"\n[Confirmed 👍] Committing {len(pend['actions'])} pending task(s) to Notion...")
+                    if any([handle_action(a, pend["sender"], sync=False, chat_id=cid, cfg=cfg) for a in pend["actions"]]):
+                        threading.Thread(target=sync_flowchart, args=(cfg,), daemon=True).start()
+                        bot_teams.react(pend["orig_msg_id"], chat_id=cid)
+
                 for msg_id, text, sender, img_urls in get_chat_text(10, chat_id=cid):      # oldest -> newest
                     if msg_id in seen_ids:
                         continue
@@ -567,7 +584,7 @@ if __name__ == "__main__":
                         continue
 
                     images = [d for u in img_urls if (d := bot_teams.download_image(u))]
-                    actions = analyze_message(text, sender, images, chat_id=cid)
+                    actions, confidence = analyze_message(text, sender, images, chat_id=cid)
                     if len(re.findall(r"^\s*\d+[.)]\s+", text, re.M)) >= 2 and len(actions) >= 2:
                         for i in range(1, len(actions)):
                             if not actions[i].get("prerequisite_task"):
@@ -575,7 +592,34 @@ if __name__ == "__main__":
                     seen_ids.add(msg_id)
                     if len(seen_ids) > 500:
                         seen_ids.pop()
-                    print(f"[Parsed actions] {actions}")
+                    needs_confirm = bool(images and confidence < OCR_CONFIDENCE_THRESHOLD)
+                    conf_tag = f" [OCR conf: {confidence:.2f}/{OCR_CONFIDENCE_THRESHOLD:.2f}]" if images else ""
+                    print(f"[Parsed actions] {actions}{conf_tag}")
+
+                    if needs_confirm and actions:
+                        first_name = (sender or "there").split()[0].capitalize()
+                        summary = "<br/>".join(
+                            f"{a['task']}"
+                            + (f" ({a['assignee'].split()[0].capitalize()})" if a.get("assignee") else "")
+                            + (f" - due {a['deadline']}" if a.get("deadline") else "")
+                            + (f" [after {a['prerequisite_task']}]" if a.get("prerequisite_task") else "")
+                            for a in actions
+                        )
+                        ask = (
+                            f"Hey {first_name}, that image was a bit hard to read! Here's what I caught:<br/>"
+                            f"{summary}<br/>"
+                            f"Drop a 👍 on this message if it looks right and I'll add it to Notion, otherwise just reply with the corrected version!"
+                        )
+                        if confirm_cid := bot_teams.send(ask, chat_id=cid):
+                            pending_confirm[cid] = {"client_msg_id": confirm_cid, "orig_msg_id": msg_id, "actions": actions, "sender": sender}
+                        continue
+                    elif needs_confirm:
+                        first_name = (sender or "there").split()[0].capitalize()
+                        bot_teams.send(f"Hey {first_name}, I couldn't quite make out the writing in that image, could you type out the task(s) or send a clearer shot?", chat_id=cid)
+                        continue
+
+                    if actions:
+                        pending_confirm.pop(cid, None)  # User replied with corrected tasks
                     if any([handle_action(a, sender, sync=False, chat_id=cid, cfg=cfg) for a in actions]):
                         threading.Thread(target=sync_flowchart, args=(cfg,), daemon=True).start()
                         bot_teams.react(msg_id, chat_id=cid)
