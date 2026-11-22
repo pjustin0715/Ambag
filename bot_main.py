@@ -237,7 +237,11 @@ def sync_flowchart():
                 pid = "n" + pre["id"].replace("-", "")
                 lines.append(f"    {pid} --> {nid}")
 
-        body = {"language": "mermaid", "rich_text": [{"type": "text", "text": {"content": "\n".join(lines)}}]}
+        code_str = "\n".join(lines)
+        body = {
+            "language": "mermaid",
+            "rich_text": [{"type": "text", "text": {"content": code_str[i:i + 2000]}} for i in range(0, len(code_str), 2000)],
+        }
 
         if not _flowchart_block_id:
             page_id = os.getenv("notion_flowchart_id", "").strip()
