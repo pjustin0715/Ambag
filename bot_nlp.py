@@ -56,15 +56,15 @@ def looks_like_task(text: str) -> bool:
     words = set(re.findall(r"[a-z']+", text.lower()))
     return bool(words & TASK_SIGNALS) or bool(DATE_RE.search(text)) or ("\n" in text and " - " in text) or bool(re.search(r"^\s*\d+[.)]\s+\w+", text, re.M))
 
-def get_chat_text(limit: int = 10) -> list[tuple[str, str, str, list[str]]]:
+def get_chat_text(limit: int = 10, chat_id: str | None = None) -> list[tuple[str, str, str, list[str]]]:
     """Cleaned human messages (oldest -> newest): [(msg_id, text, sender, img_urls), ...]."""
     messages = []
-    for m in reversed(read(limit)):
+    for m in reversed(read(limit, chat_id=chat_id)):
         raw = m.get("content", "")
         imgs = [u for u in re.findall(r'<img[^>]+src="([^"]+)"', raw, flags=re.I) if "emoticon" not in u.lower() and "emoji" not in u.lower()]
         text = clean_teams_text(raw)
         sender = m.get("imdisplayname") or m.get("fromGivenNameInToken") or ""
-        if (text or imgs) and not text.startswith(BOT_PREFIX) and "just a reminder, your task" not in text and "You can start with your task" not in text:
+        if (text or imgs) and not text.startswith(BOT_PREFIX) and "just a reminder, your task" not in text and "You can start with your task" not in text and "Your task tracker & flowchart is ready:" not in text and "that image was a bit hard to read!" not in text and "couldn't quite make out the writing" not in text:
             messages.append((m.get("id", ""), text, sender, imgs))
     return messages
 
