@@ -26,16 +26,91 @@ GEMINI_API_KEY = os.getenv("gemini")
 GROQ_API_KEY = os.getenv("groq") or os.getenv("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.getenv("openrouter") or os.getenv("OPENROUTER_API_KEY")
 NOTION_TOKEN = os.getenv("notion")
-NOTION_DB_ID = os.getenv("notion_db_id", "...")  # Add this to your .env
+NOTION_DB_ID = os.getenv("notion_db_id", "").strip()
+NOTION_ROOT_PAGE_ID = os.getenv("notion_root_page_id", "").strip()
+CHATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chats.json")
 
 
 _http = requests.Session()
 llm = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=20000))
 notion = Client(auth=NOTION_TOKEN)
-_DB_INFO = notion.databases.retrieve(NOTION_DB_ID) if "--setup" not in sys.argv else {}
+_DB_INFO = notion.databases.retrieve(NOTION_DB_ID) if (NOTION_DB_ID and NOTION_DB_ID != "..." and "--setup" not in sys.argv) else {}
 DATA_SOURCE_ID = _DB_INFO["data_sources"][0]["id"] if _DB_INFO else ""
 _flowchart_block_id = None
-recent_tasks = deque(maxlen=20)  # (task_name, assignee, sender)
+recent_by_chat: dict[str, deque] = {}  # chat_id -> deque[(task_name, assignee, sender)]
+
+
+def _get_recent(chat_id: str) -> deque:
+    return recent_by_chat.setdefault(chat_id, deque(maxlen=20))
+
+
+def load_chats() -> dict:
+    chats = json.load(open(CHATS_FILE)) if os.path.exists(CHATS_FILE) else {}
+    # Keep existing single-chat .env setup working automatically
+    if bot_teams.CHAT_ID and NOTION_DB_ID and DATA_SOURCE_ID and bot_teams.CHAT_ID not in chats:
+        chats[bot_teams.CHAT_ID] = {
+            "db_id": NOTION_DB_ID,
+            "data_source_id": DATA_SOURCE_ID,
+            "flowchart_block_id": _flowchart_block_id,
+            "name": "Default Chat",
+        }
+    return chats
+
+
+def save_chats(chats: dict):
+    with open(CHATS_FILE, "w") as f:
+        json.dump(chats, f, indent=2)
+
+
+def provision_chat(chat_id: str, topic: str) -> dict:
+    """Create a dedicated Notion page containing an inline Task List DB + Mermaid flowchart, then send its link."""
+    page = notion.pages.create(
+        parent={"page_id": NOTION_ROOT_PAGE_ID},
+        properties={"title": [{"text": {"content": topic}}]},
+    )
+    db = notion.databases.create(
+        parent={"type": "page_id", "page_id": page["id"]},
+        is_inline=True,
+        title=[{"type": "text", "text": {"content": "Task List"}}],
+        initial_data_source={
+            "properties": {
+                "Task Name": {"title": {}},
+                "Assignee": {"rich_text": {}},
+                "Deadline": {"date": {}},
+                "Completed": {"checkbox": {}},
+            }
+        },
+    )
+    ds_id = db["data_sources"][0]["id"]
+    notion.data_sources.update(
+        data_source_id=ds_id,
+        properties={
+            "Prerequisite": {
+                "relation": {"data_source_id": ds_id, "type": "single_property", "single_property": {}}
+            }
+        },
+    )
+    created = notion.blocks.children.append(
+        block_id=page["id"],
+        children=[{
+            "object": "block",
+            "type": "code",
+            "code": {
+                "language": "mermaid",
+                "rich_text": [{"type": "text", "text": {"content": 'flowchart LR\n    empty["No tasks yet"]'}}],
+            },
+        }],
+    )
+    cfg = {
+        "name": topic,
+        "page_url": page["url"],
+        "db_id": db["id"],
+        "data_source_id": ds_id,
+        "flowchart_block_id": created["results"][0]["id"],
+    }
+    bot_teams.send(f'Hi! Your task tracker & flowchart is ready: {page["url"]}', chat_id=chat_id)
+    print(f"[Provisioned] '{topic}' -> {page['url']}")
+    return cfg
 
 
 class TaskAction(BaseModel):
@@ -86,16 +161,17 @@ def _call_openai_compat(prompt: str, url: str, api_key: str, model: str, images:
     return [a for a in data.get("actions", []) if a.get("action") != "ignore"]
 
 
-def analyze_message(text: str, sender: str = "", images: list[tuple[bytes, str]] | None = None) -> list[dict]:
+def analyze_message(text: str, sender: str = "", images: list[tuple[bytes, str]] | None = None, chat_id: str | None = None) -> list[dict]:
     """Returns list of JSON actions (empty if irrelevant)."""
     today = date.today()
     cal = ", ".join((today + timedelta(days=i)).strftime("%a %Y-%m-%d") for i in range(14))
+    recent = _get_recent(chat_id or bot_teams.CHAT_ID)
     recent_str = ", ".join(
-        f"'{t}' (assignee: {a or 'none'}, by: {s or 'unknown'})" for t, a, s in list(recent_tasks)[-5:]
+        f"'{t}' (assignee: {a or 'none'}, by: {s or 'unknown'})" for t, a, s in list(recent)[-5:]
     )
     last_sender_task = next(
-        (t for t, _, s in reversed(recent_tasks) if s == sender),
-        recent_tasks[-1][0] if recent_tasks else None,
+        (t for t, _, s in reversed(recent) if s == sender),
+        recent[-1][0] if recent else None,
     )
     prompt = (
         f"Today is {today.isoformat()} ({today.strftime('%A')}). "
@@ -175,32 +251,35 @@ def analyze_message(text: str, sender: str = "", images: list[tuple[bytes, str]]
 # ================= NOTION DB =================
 
 
-def find_task(name: str):
+def find_task(name: str, ds_id: str | None = None):
     if not name:
         return None
+    ds = ds_id or DATA_SOURCE_ID
     # 1. Exact match
-    res = notion.data_sources.query(data_source_id=DATA_SOURCE_ID, filter={
+    res = notion.data_sources.query(data_source_id=ds, filter={
                                     "property": "Task Name", "title": {"equals": name}})
     if res.get("results"):
         return res["results"][0]
 
     # 2. NLP fuzzy match across active (uncompleted) tasks
-    open_tasks = notion.data_sources.query(data_source_id=DATA_SOURCE_ID, filter={
+    open_tasks = notion.data_sources.query(data_source_id=ds, filter={
                                            "property": "Completed", "checkbox": {"equals": False}})
     match = match_task_candidate(name, open_tasks.get("results", []))
     if match:
         return match
 
     # 3. Fallback: check all tasks
-    all_tasks = notion.data_sources.query(data_source_id=DATA_SOURCE_ID)
+    all_tasks = notion.data_sources.query(data_source_id=ds)
     return match_task_candidate(name, all_tasks.get("results", []))
 
 
-def sync_flowchart():
+def sync_flowchart(cfg: dict | None = None):
     """Renders all Notion tasks + prerequisites into a native Notion Mermaid block."""
     global _flowchart_block_id
     try:
-        tasks = notion.data_sources.query(data_source_id=DATA_SOURCE_ID).get("results", [])
+        ds = (cfg or {}).get("data_source_id") or DATA_SOURCE_ID
+        block_id = (cfg or {}).get("flowchart_block_id") or (None if cfg else _flowchart_block_id)
+        tasks = notion.data_sources.query(data_source_id=ds).get("results", [])
         lines = [
             "flowchart LR",
             "    classDef done fill:#dcfce7,stroke:#111827,stroke-width:1.5px,color:#111827,rx:8,ry:8;",
@@ -243,7 +322,7 @@ def sync_flowchart():
             "rich_text": [{"type": "text", "text": {"content": code_str[i:i + 2000]}} for i in range(0, len(code_str), 2000)],
         }
 
-        if not _flowchart_block_id:
+        if not block_id:
             page_id = os.getenv("notion_flowchart_id", "").strip()
             if not page_id:
                 res = notion.search(query="Task Flowchart").get("results", [])
@@ -255,26 +334,36 @@ def sync_flowchart():
 
             for b in notion.blocks.children.list(block_id=page_id).get("results", []):
                 if b.get("type") == "code" and b.get("code", {}).get("language") == "mermaid":
-                    _flowchart_block_id = b["id"]
+                    block_id = b["id"]
                     break
-            if not _flowchart_block_id:
+            if not block_id:
                 created = notion.blocks.children.append(
                     block_id=page_id,
                     children=[{"object": "block", "type": "code", "code": body}],
                 )
-                _flowchart_block_id = created["results"][0]["id"]
+                block_id = created["results"][0]["id"]
+                if cfg is not None:
+                    cfg["flowchart_block_id"] = block_id
+                else:
+                    _flowchart_block_id = block_id
                 print("[Done] Created Mermaid flowchart in Notion")
                 return
+            if cfg is not None:
+                cfg["flowchart_block_id"] = block_id
+            else:
+                _flowchart_block_id = block_id
 
-        notion.blocks.update(block_id=_flowchart_block_id, code=body)
+        notion.blocks.update(block_id=block_id, code=body)
         print("[Done] Synced Notion flowchart")
     except Exception as e:
         print(f"[Flowchart Error] {e}")
 
 
-def handle_action(data: dict, sender: str = "", sync: bool = True) -> bool:
+def handle_action(data: dict, sender: str = "", sync: bool = True, chat_id: str | None = None, cfg: dict | None = None) -> bool:
     task_name = data.get("task")
     action = data.get("action")
+    db_id = (cfg or {}).get("db_id") or NOTION_DB_ID
+    ds_id = (cfg or {}).get("data_source_id") or DATA_SOURCE_ID
 
     if action in ("create", "assign"):
         props = {}
@@ -283,11 +372,11 @@ def handle_action(data: dict, sender: str = "", sync: bool = True) -> bool:
         if data.get("deadline") and len(data["deadline"]) == 10 and data["deadline"][4] == "-" and data["deadline"][7] == "-":
             props["Deadline"] = {"date": {"start": data["deadline"]}}
         if data.get("prerequisite_task") and data["prerequisite_task"].lower() != (task_name or "").lower():
-            prereq = find_task(data["prerequisite_task"])
+            prereq = find_task(data["prerequisite_task"], ds_id)
             if prereq:
                 props["Prerequisite"] = {"relation": [{"id": prereq["id"]}]}
 
-        page = find_task(task_name)
+        page = find_task(task_name, ds_id)
         if page:
             if not props:
                 print(f"[Skip] Task already exists: {task_name}")
@@ -296,22 +385,22 @@ def handle_action(data: dict, sender: str = "", sync: bool = True) -> bool:
             print(f"[Done] Updated task {task_name}: {', '.join(props.keys())}")
         else:
             props["Task Name"] = {"title": [{"text": {"content": task_name}}]}
-            notion.pages.create(parent={"database_id": NOTION_DB_ID}, properties=props)
+            notion.pages.create(parent={"database_id": db_id}, properties=props)
             assigned_str = f" assigned to {data['assignee']}" if data.get('assignee') else ""
             print(f"[Done] Created task: {task_name}{assigned_str}")
-        recent_tasks.append((task_name, data.get("assignee"), sender))
+        _get_recent(chat_id or bot_teams.CHAT_ID).append((task_name, data.get("assignee"), sender))
         if sync:
-            sync_flowchart()
+            sync_flowchart(cfg)
         return True
 
     elif action == "complete":
-        page = find_task(task_name)
+        page = find_task(task_name, ds_id)
         if page:
             notion.pages.update(page["id"], properties={
                                 "Completed": {"checkbox": True}})
             print(f"[Done] Completed task: {task_name}")
             if sync:
-                sync_flowchart()
+                sync_flowchart(cfg)
 
             # Check prerequisites and notify
             prev_rt = page["properties"].get("Assignee", {}).get("rich_text", [])
@@ -319,7 +408,7 @@ def handle_action(data: dict, sender: str = "", sync: bool = True) -> bool:
             prev_assignee = prev_raw.split()[0].capitalize()
             prev_title = page["properties"]["Task Name"]["title"][0]["text"]["content"]
 
-            deps = notion.data_sources.query(data_source_id=DATA_SOURCE_ID, filter={
+            deps = notion.data_sources.query(data_source_id=ds_id, filter={
                                              "property": "Prerequisite", "relation": {"contains": page["id"]}})
             for dep in deps["results"]:
                 dep_rt = dep["properties"].get("Assignee", {}).get("rich_text", [])
@@ -327,7 +416,8 @@ def handle_action(data: dict, sender: str = "", sync: bool = True) -> bool:
                 assignee = dep_raw.split()[0].capitalize()
                 dep_name = dep["properties"]["Task Name"]["title"][0]["text"]["content"]
                 bot_teams.send(
-                    f'@{assignee}, {prev_assignee} has completed the task "{prev_title}". You can start with your task "{dep_name}"'
+                    f'@{assignee}, {prev_assignee} has completed the task "{prev_title}". You can start with your task "{dep_name}"',
+                    chat_id=chat_id,
                 )
                 print(f"[Notification] Reminded {assignee} for {dep_name}")
             return True
@@ -337,45 +427,48 @@ def handle_action(data: dict, sender: str = "", sync: bool = True) -> bool:
 
 
 def check_deadlines():
-    """Send @mention reminders for open tasks due in 7 days, 1 day, today, or past due."""
+    """Send @mention reminders for open tasks across all active chats."""
     today = date.today()
-    open_tasks = notion.data_sources.query(
-        data_source_id=DATA_SOURCE_ID,
-        filter={"property": "Completed", "checkbox": {"equals": False}},
-    ).get("results", [])
-
-    for t in open_tasks:
-        props = t["properties"]
-        deadline = (props.get("Deadline", {}).get("date") or {}).get("start", "")
-        if not deadline:
+    for cid, cfg in load_chats().items():
+        if cfg.get("ignored") or not cfg.get("data_source_id"):
             continue
-        try:
-            days_left = (date.fromisoformat(deadline[:10]) - today).days
-        except ValueError:
-            continue
+        open_tasks = notion.data_sources.query(
+            data_source_id=cfg["data_source_id"],
+            filter={"property": "Completed", "checkbox": {"equals": False}},
+        ).get("results", [])
 
-        if days_left == 7:
-            suffix = "is due in 7 days."
-        elif days_left == 1:
-            suffix = "is due tomorrow."
-        elif days_left == 0:
-            suffix = "is due today!"
-        elif days_left < 0:
-            suffix = "is past due!!!"
-        else:
-            continue
+        for t in open_tasks:
+            props = t["properties"]
+            deadline = (props.get("Deadline", {}).get("date") or {}).get("start", "")
+            if not deadline:
+                continue
+            try:
+                days_left = (date.fromisoformat(deadline[:10]) - today).days
+            except ValueError:
+                continue
 
-        title_list = props.get("Task Name", {}).get("title", [])
-        title = title_list[0]["text"]["content"] if title_list else "Untitled"
-        if title.lower() == "task flowchart":
-            continue
-        assignee_list = props.get("Assignee", {}).get("rich_text", [])
-        assignee = assignee_list[0]["text"]["content"].strip() if assignee_list else "Someone"
-        first_name = assignee.split()[0].capitalize()
+            if days_left == 7:
+                suffix = "is due in 7 days."
+            elif days_left == 1:
+                suffix = "is due tomorrow."
+            elif days_left == 0:
+                suffix = "is due today!"
+            elif days_left < 0:
+                suffix = "is past due!!!"
+            else:
+                continue
 
-        msg = f'@{first_name}, just a reminder, your task "{title}" {suffix}'
-        if bot_teams.send(msg):
-            print(f"[Reminder] Sent for '{title}' ({suffix}) to {first_name}")
+            title_list = props.get("Task Name", {}).get("title", [])
+            title = title_list[0]["text"]["content"] if title_list else "Untitled"
+            if title.lower() == "task flowchart":
+                continue
+            assignee_list = props.get("Assignee", {}).get("rich_text", [])
+            assignee = assignee_list[0]["text"]["content"].strip() if assignee_list else "Someone"
+            first_name = assignee.split()[0].capitalize()
+
+            msg = f'@{first_name}, just a reminder, your task "{title}" {suffix}'
+            if bot_teams.send(msg, chat_id=cid):
+                print(f"[Reminder] Sent for '{title}' ({suffix}) to {first_name}")
 
 
 def run_setup():
@@ -399,7 +492,7 @@ def run_setup():
     elif m := re.search(r"authentication:\s*(skypetoken=[^\r\n'\"]+)", blob, re.I):
         updates["teams_token"] = m.group(1).strip()
 
-    for key in ("notion", "notion_db_id", "groq", "openrouter", "gemini"):
+    for key in ("notion", "notion_root_page_id", "notion_db_id", "groq", "openrouter", "gemini"):
         if not os.getenv(key):
             if val := input(f"Enter {key} (Enter to skip): ").strip():
                 updates[key] = val
@@ -420,38 +513,72 @@ if __name__ == "__main__":
         sys.exit(0)
 
     print("Bot running... Polling for messages.")
-    sync_flowchart()
+    chats = load_chats()
     seen_ids = set()
 
-    # Mark existing history as seen so a restart doesn't re-process old messages
-    for msg_id, _, _, _ in get_chat_text(10):
-        seen_ids.add(msg_id)
+    # On startup, ignore pre-existing group chats not in chats.json so we don't spam old chats
+    if NOTION_ROOT_PAGE_ID:
+        try:
+            changed = False
+            for cid, topic in bot_teams.list_group_chats():
+                if cid not in chats:
+                    chats[cid] = {"ignored": True, "name": topic}
+                    changed = True
+            if changed:
+                save_chats(chats)
+        except Exception as e:
+            print(f"[Discovery Warning] {e}")
 
+    # Sync flowcharts & mark existing message history as seen for active chats
+    for cid, cfg in chats.items():
+        if cfg.get("ignored"):
+            continue
+        sync_flowchart(cfg)
+        try:
+            for msg_id, _, _, _ in get_chat_text(10, chat_id=cid):
+                seen_ids.add(msg_id)
+        except Exception as e:
+            print(f"[Init Error] {cid}: {e}")
+
+    poll_count = 0
     while True:
         try:
-            for msg_id, text, sender, img_urls in get_chat_text(10):      # oldest -> newest
-                if msg_id in seen_ids:
-                    continue
+            # Check for newly joined group chats every ~30s
+            if NOTION_ROOT_PAGE_ID and poll_count % 6 == 0:
+                for cid, topic in bot_teams.list_group_chats():
+                    if cid not in chats:
+                        chats[cid] = provision_chat(cid, topic)
+                        save_chats(chats)
+                        for msg_id, _, _, _ in get_chat_text(10, chat_id=cid):
+                            seen_ids.add(msg_id)
+            poll_count += 1
 
-                print(f"\n[Incoming message from {sender or 'unknown'}] {text or '(image)'}" + (f" [{len(img_urls)} img]" if img_urls else ""))
-                if not img_urls and not looks_like_task(text):
+            for cid, cfg in list(chats.items()):
+                if cfg.get("ignored"):
+                    continue
+                for msg_id, text, sender, img_urls in get_chat_text(10, chat_id=cid):      # oldest -> newest
+                    if msg_id in seen_ids:
+                        continue
+
+                    print(f"\n[{cfg.get('name', cid[:12])} | {sender or 'unknown'}] {text or '(image)'}" + (f" [{len(img_urls)} img]" if img_urls else ""))
+                    if not img_urls and not looks_like_task(text):
+                        seen_ids.add(msg_id)
+                        print("[Skip] No task signal")
+                        continue
+
+                    images = [d for u in img_urls if (d := bot_teams.download_image(u))]
+                    actions = analyze_message(text, sender, images, chat_id=cid)
+                    if len(re.findall(r"^\s*\d+[.)]\s+", text, re.M)) >= 2 and len(actions) >= 2:
+                        for i in range(1, len(actions)):
+                            if not actions[i].get("prerequisite_task"):
+                                actions[i]["prerequisite_task"] = actions[i - 1].get("task")
                     seen_ids.add(msg_id)
-                    print("[Skip] No task signal")
-                    continue
-
-                images = [d for u in img_urls if (d := bot_teams.download_image(u))]
-                actions = analyze_message(text, sender, images)
-                if len(re.findall(r"^\s*\d+[.)]\s+", text, re.M)) >= 2 and len(actions) >= 2:
-                    for i in range(1, len(actions)):
-                        if not actions[i].get("prerequisite_task"):
-                            actions[i]["prerequisite_task"] = actions[i - 1].get("task")
-                seen_ids.add(msg_id)
-                if len(seen_ids) > 100:
-                    seen_ids.pop()
-                print(f"[Parsed actions] {actions}")
-                if any([handle_action(a, sender, sync=False) for a in actions]):
-                    threading.Thread(target=sync_flowchart, daemon=True).start()
-                    bot_teams.react(msg_id)
+                    if len(seen_ids) > 500:
+                        seen_ids.pop()
+                    print(f"[Parsed actions] {actions}")
+                    if any([handle_action(a, sender, sync=False, chat_id=cid, cfg=cfg) for a in actions]):
+                        threading.Thread(target=sync_flowchart, args=(cfg,), daemon=True).start()
+                        bot_teams.react(msg_id, chat_id=cid)
         except Exception as e:
             print(f"Error: {e}")
 
