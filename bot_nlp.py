@@ -17,10 +17,18 @@ for pkg in ["wordnet", "stopwords", "omw-1.4"]:
             pass
 
 _lemmatizer = WordNetLemmatizer()
+_TAGALOG_STOP_WORDS = {
+    "ang", "ng", "nang", "sa", "si", "ni", "kay", "sina", "nina", "kina",
+    "mga", "yung", "ung", "yun", "yan", "ito", "iyon", "na", "pa", "po",
+    "ko", "mo", "ka", "ako", "ikaw", "siya", "kami", "tayo", "kayo", "sila",
+    "namin", "natin", "nila", "akin", "sakin", "iyo", "kanya", "lang", "lng",
+    "din", "rin", "naman", "nmn", "kasi", "kse", "para", "ba", "eh", "nga",
+    "daw", "raw", "muna", "ulit", "pala", "talaga",
+}
 try:
-    _STOP_WORDS = set(stopwords.words("english"))
+    _STOP_WORDS = set(stopwords.words("english")) | _TAGALOG_STOP_WORDS
 except Exception:
-    _STOP_WORDS = {"the", "a", "an", "to", "for", "of", "in", "on", "at", "by", "with"}
+    _STOP_WORDS = {"the", "a", "an", "to", "for", "of", "in", "on", "at", "by", "with"} | _TAGALOG_STOP_WORDS
 
 BOT_PREFIX = "🔔"
 
@@ -31,13 +39,26 @@ TASK_SIGNALS = {
     "needs", "todo", "task", "can", "review", "work", "working", "i'll", "then", "once",
     "have", "has", "i've", "we've", "already", "just", "went", "gone", "did", "sent",
     "submitted", "pushed", "merged", "reviewed", "drafted", "wrote", "written",
+    # Tagalog / Taglish task, completion, and sequencing signals
+    "bahala", "gawa", "gawin", "gagawa", "gagawin", "nagawa", "ginawa",
+    "kailangan", "kelangan", "kailangang", "paki", "pakigawa", "simulan", "umpisahan",
+    "kunin", "ipasa", "pasa", "pwede", "pede", "tapos", "tpos", "natapos",
+    "napasa", "nasubmit", "oks", "goods", "pagkatapos", "sunod", "kasunod",
+    "bago", "hanggang", "kapag", "pag", "tapusin",
 }
+
+TAGLISH_RE = re.compile(
+    r"\b(ako\s+na|si\s+\w+\s+na|kay\s+\w+|(mag|nag|pag|ni|na|in|ipa)-[a-z]+)\b",
+    re.I,
+)
 
 DATE_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}|"
     r"\b(mon|tues?|wed(nes)?|thu(rs)?|fri|sat(ur)?|sun)(day)?\b|"
+    r"\b(lunes|martes|miy?erkules|hu?webes|biy?ernes|sabado|linggo)\b|"
     r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b|"
-    r"\b(today|tomorrow|tonight|this week|next week|weekend|in \d+ (day|week|month)s?)\b",
+    r"\b(today|tomorrow|tonight|this week|next week|weekend|in \d+ (day|week|month)s?)\b|"
+    r"\b(ngayon|ngayong|bukas|bkas|mamaya|makalawa|susunod|kinabukasan)\b",
     re.I,
 )
 
@@ -52,9 +73,15 @@ def clean_teams_text(raw_text: str) -> str:
     return re.sub(r"\n+", "\n", text).strip()
 
 def looks_like_task(text: str) -> bool:
-    """Pre-filter: True if message contains task keywords, dates, numbered list, or multi-line dash list."""
+    """Pre-filter: True if message contains English/Tagalog task cues, dates, or lists."""
     words = set(re.findall(r"[a-z']+", text.lower()))
-    return bool(words & TASK_SIGNALS) or bool(DATE_RE.search(text)) or ("\n" in text and " - " in text) or bool(re.search(r"^\s*\d+[.)]\s+\w+", text, re.M))
+    return (
+        bool(words & TASK_SIGNALS)
+        or bool(TAGLISH_RE.search(text))
+        or bool(DATE_RE.search(text))
+        or ("\n" in text and " - " in text)
+        or bool(re.search(r"^\s*\d+[.)]\s+\w+", text, re.M))
+    )
 
 def get_chat_text(limit: int = 10, chat_id: str | None = None) -> list[tuple[str, str, str, list[str]]]:
     """Cleaned human messages (oldest -> newest): [(msg_id, text, sender, img_urls), ...]."""
@@ -69,8 +96,10 @@ def get_chat_text(limit: int = 10, chat_id: str | None = None) -> list[tuple[str
     return messages
 
 def normalize_tokens(text: str) -> set[str]:
-    """Lowercase, remove stopwords, and lemmatize to base forms."""
-    words = re.findall(r"[a-z0-9]+", text.lower())
+    """Lowercase, strip Taglish hyphenated verb prefixes, remove EN/TL stopwords, and lemmatize."""
+    # Strip hyphenated Taglish prefixes (e.g., 'nag-review' -> 'review', 'mag-push' -> 'push')
+    cleaned = re.sub(r"\b(?:mag|nag|pag|ni|na|in|ipa)-([a-z0-9]+)\b", r"\1", text.lower())
+    words = re.findall(r"[a-z0-9]+", cleaned)
     lemmas = set()
     for w in words:
         if w not in _STOP_WORDS:
@@ -104,3 +133,22 @@ def match_task_candidate(target_name: str, candidates: list[dict], threshold: fl
         if score > best_score:
             best_score, best_page = score, page
     return best_page if best_score >= threshold else None
+
+
+if __name__ == "__main__":
+    # Self-check for Tagalog / Taglish pre-filter & fuzzy matching
+    for msg in (
+        "ako na bahala sa intro",
+        "si jonas na sa slides bukas",
+        "tpos ko na ung chapter 1",
+        "nag-push na ko ng code",
+        "sa makalawa yung draft",
+        "kay steven yung wiring",
+    ):
+        assert looks_like_task(msg), f"Should pass looks_like_task: {msg}"
+    for chatter in ("haha oo nga eh", "kain muna tayo", "sige g", "gutom na ako"):
+        assert not looks_like_task(chatter), f"Should skip chatter: {chatter}"
+    assert task_similarity("ni-review na pr", "review pr") == 1.0
+    assert task_similarity("yung slides ko", "slides") == 1.0
+    assert task_similarity("gawin yung paper", "gawin yung draft") < 0.75
+    print("bot_nlp Taglish self-check passed!")

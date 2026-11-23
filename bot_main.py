@@ -146,6 +146,8 @@ def _call_openai_compat(prompt: str, url: str, api_key: str, model: str, images:
     }
     if "openrouter.ai" in url and model == "openrouter/free":
         body["reasoning"] = {"enabled": False}
+    if model == "openai/gpt-oss-20b":
+        body["reasoning_effort"] = "low"
     if model == "openai/gpt-4o-mini":
         body["response_format"] = {"type": "json_object"}
     r = _http.post(
@@ -156,7 +158,7 @@ def _call_openai_compat(prompt: str, url: str, api_key: str, model: str, images:
     )
     if not r.ok:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-    raw = r.json()["choices"][0]["message"]["content"].strip()
+    raw = (r.json()["choices"][0]["message"].get("content") or "").strip()
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
     data = json.loads(raw)
@@ -182,34 +184,35 @@ def analyze_message(text: str, sender: str = "", images: list[tuple[bytes, str]]
         f"Message sender: {sender or 'Unknown'}.\n"
         f"Upcoming 14 days: {cal}.\n"
         f"Recent tasks (oldest -> newest): {recent_str or 'none'}.\n"
-        "Extract ALL task actions from the message and/or any attached whiteboard/notes image (split into separate items across lines OR conjunctions like 'and', 'then', 'also', ',', ';'):\n"
+        "Extract ALL task actions from the message and/or any attached whiteboard/notes image. Understand natural English, Tagalog, and colloquial Taglish (split across lines OR connectors like 'and', 'then', 'also', 'at', 'tapos', ',', ';'):\n"
         "- ocr_confidence: float 0.0-1.0 for attached images (1.0 if no image). Be strict: 0.95-1.0 ONLY for crisp typed/printed text; 0.75-0.89 for clear handwriting; 0.50-0.74 for messy/blurry/skewed handwriting; <0.50 if mostly illegible. Lower the score if ANY word, name, or date had to be guessed.\n"
         "- action:\n"
-        "  * 'assign': someone takes or is assigned a task (e.g. '[Name] will [task]', 'I will/can [task]', 'assign [task] to [Name]', '[task] - [Name] - [date]').\n"
-        "  * 'complete': task is finished, done, or stated in past/present-perfect tense as already performed (e.g. 'I have gone to class', 'went to school', 'already reviewed the PR', 'pushed the changes').\n"
-        "  * 'create': new task is created without assignment.\n"
-        "  * 'ignore': no task action.\n"
-        f"- assignee: Person assigned. If first-person ('I', 'me', 'myself'), use sender '{sender}'. Only set if explicitly stated, else null.\n"
-        "- task: The task name.\n"
+        "  * 'assign': someone takes or is assigned a task (e.g. '[Name] will [task]', 'I will/can [task]', 'ako na sa [task]', 'ako na bahala sa [task]', 'si [Name] na sa [task]', 'kay [Name] yung [task]', '[task] - [Name] - [date]').\n"
+        "  * 'complete': task is finished/done or stated as already performed (e.g. 'I have gone to class', 'tapos na', 'tapos ko na', 'tpos na', 'nagawa ko na', 'napasa ko na', 'oks na', 'goods na', 'na-push ko na'). Note: 'g' / 'g na' means 'let's go', NOT complete.\n"
+        "  * 'create': new task is created without assignment (e.g. 'kailangan gawin yung [task]').\n"
+        "  * 'ignore': casual chatter or no task action.\n"
+        f"- assignee: Person assigned. If first-person ('I', 'me', 'myself', 'ako', 'ko', 'akin', 'sakin', 'ako na'), use sender '{sender}'. Only set if explicitly stated, else null.\n"
+        "- task: Clean, concise task name (strip filler words like 'yung', 'ang', 'na', 'ko'). If referring to an existing task in Recent tasks (even in another language, e.g. Tagalog vs English), reuse that exact existing task name.\n"
         "- deadline: ISO 8601 (YYYY-MM-DD) or null. Resolve relative phrases using the calendar above: "
-        "'this <day>' or '<day>' = nearest upcoming <day>; "
-        "'next <day>' = <day> in the following calendar week (or +7 days from this <day>); "
+        "'today'/'ngayon'/'mamaya' = today; 'tomorrow'/'bukas'/'bkas' = +1 day; 'sa makalawa' = +2 days; "
+        "'this <day>'/'<day>'/'sa <day>'/'ngayong <day>' (lunes..linggo) = nearest upcoming <day>; "
+        "'next <day>'/'sa susunod na <day>' = <day> in the following calendar week (or +7 days from this <day>); "
         "each extra 'next' (e.g. 'next next <day>') adds +7 days; "
-        "'this week' = upcoming Friday (or Sunday if past Fri); 'next week' = Friday of next week; "
+        "'this week'/'ngayong linggo' = upcoming Friday (or Sunday if past Fri); 'next week'/'sa susunod na linggo' = Friday of next week; "
         "'in N days/weeks' = exact offset from today.\n"
-        "- prerequisite_task: Clean underlying task name only (e.g. if 'after Steven is done eating', prerequisite_task is 'eat'; if 'after reviewing PR', prerequisite_task is 'review PR'). "
-        f"Sequential/conditional words like 'then', 'once', 'before', 'after', 'afterwards', 'after that' link tasks: in 'A then B' or 'once A is done, B', B's prerequisite_task is A; if no task is named after 'after'/'then', use '{last_sender_task or 'null'}' (or the previous task in this message). "
-        "If it says 'after [Person]' (e.g. 'after justin'), use [Person]'s most recent task from Recent tasks above or earlier in this message. "
+        "- prerequisite_task: Clean underlying task name only (e.g. if 'after Steven is done eating' or 'pagkatapos kumain ni Steven', prerequisite_task is 'eat'/'kumain'). "
+        f"Sequential/conditional connectors ('then', 'once', 'before', 'after', 'afterwards', 'pagkatapos', 'kapag tapos na', 'pag tapos na', 'bago', 'sunod', or 'tapos' used as 'then') link tasks: in 'A then B' or 'A tapos B', B's prerequisite_task is A; if no task is named after 'after'/'then'/'pagkatapos', use '{last_sender_task or 'null'}' (or the previous task in this message). "
+        "If it says 'after [Person]' / 'pagkatapos ni [Person]', use [Person]'s most recent task from Recent tasks above or earlier in this message. "
         "If tasks are numbered in order (e.g. '1. A', '2. B', '3. C' in text or image), strip the numbers from task names and chain each item's prerequisite_task to the previous numbered task (unless another prerequisite is stated). "
-        "Do NOT include person names or status phrases like 'is done'/'after', and NEVER set prerequisite_task to the task itself.\n"
-        f"Example: 'I will go to school tomorrow and steven will bring the laptop after' -> 2 items: "
-        f"(1) task='go to school', assignee='{sender or 'sender'}', deadline=tomorrow, prerequisite_task=null; "
-        "(2) task='bring the laptop', assignee='steven', deadline=null, prerequisite_task='go to school'.\n"
+        "Do NOT include person names or status phrases like 'is done'/'tapos na'/'after', and NEVER set prerequisite_task to the task itself.\n"
+        f"Examples:\n"
+        f"  1) 'I will go to school tomorrow and steven will bring the laptop after' -> (1) task='go to school', assignee='{sender or 'sender'}', deadline=tomorrow, prerequisite_task=null; (2) task='bring the laptop', assignee='steven', deadline=null, prerequisite_task='go to school'.\n"
+        f"  2) 'ako na bahala sa slides bukas tapos si jonas mag-review sa makalawa' -> (1) task='slides', assignee='{sender or 'sender'}', deadline=+1d, prerequisite_task=null; (2) task='review slides', assignee='jonas', deadline=+2d, prerequisite_task='slides'.\n"
         f"Message:\n{text or '(see attached image)'}"
     )
     last_err = None
     if GROQ_API_KEY:
-        groq_models = ("qwen/qwen3.8-27b",) if images else ("openai/gpt-oss-20b", "qwen/qwen3.8-27b")
+        groq_models = ("qwen/qwen3.8-27b",) if images else ("qwen/qwen3.8-27b", "openai/gpt-oss-20b")
         for g_model in groq_models:
             try:
                 return _call_openai_compat(prompt, "https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY, g_model, images)
