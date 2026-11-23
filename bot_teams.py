@@ -1,11 +1,15 @@
 import json
 import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import os
 from dotenv import load_dotenv
 load_dotenv()
 
 _http = requests.Session()
+_http.mount("https://", HTTPAdapter(max_retries=Retry(total=3, connect=3, read=2, backoff_factor=0.3, allowed_methods=frozenset({"GET", "PUT", "POST"}))))
+_last_client_id = 0
 TOKEN = os.getenv('teams_token', '')
 MEDIA_TOKEN = os.getenv('teams_media_token', '').strip()
 CHAT_ID = os.getenv('teams_chat_id', '').strip()
@@ -24,7 +28,8 @@ def list_group_chats(limit: int = 30) -> list[tuple[str, str]]:
     """Return [(chat_id, topic)] for group chats (@thread.v2) the bot account belongs to."""
     res = _http.get(f"{BASE_URL}?view=msnp24Equivalent&pageSize={limit}", headers=HEADERS, timeout=15)
     if not res.ok:
-        raise RuntimeError(f"Teams conversations request failed with HTTP {res.status_code}")
+        hint = " (token expired? re-run with --setup)" if res.status_code == 401 else ""
+        raise RuntimeError(f"Teams conversations request failed with HTTP {res.status_code}{hint}")
     chats = []
     for c in res.json().get("conversations", []):
         cid = c.get("id", "")
@@ -35,7 +40,9 @@ def list_group_chats(limit: int = 30) -> list[tuple[str, str]]:
 
 # ponytail: minimal payload; Teams only strictly requires content, type, and a unique client ID
 def send(text: str, chat_id: str | None = None, mentions: list[tuple[str, str]] | None = None) -> str | None:
-    client_id = str(int(time.time() * 1000))
+    global _last_client_id
+    _last_client_id = max(int(time.time() * 1000), _last_client_id + 1)
+    client_id = str(_last_client_id)
     payload = {
         "content": f"<p>{text}</p>",
         "messagetype": "RichText/Html",
@@ -55,8 +62,12 @@ def send(text: str, chat_id: str | None = None, mentions: list[tuple[str, str]] 
                 for i, (mri, name) in enumerate(mentions)
             ])
         }
-    ok = _http.post(_msg_url(chat_id), headers=HEADERS, json=payload, timeout=15).status_code in (200, 201)
-    return client_id if ok else None
+    res = _http.post(_msg_url(chat_id), headers=HEADERS, json=payload, timeout=15)
+    if res.status_code not in (200, 201):
+        hint = " (token expired? re-run with --setup)" if res.status_code == 401 else ""
+        print(f"[Send Error] HTTP {res.status_code}{hint}: {res.text[:120]}")
+        return None
+    return client_id
 
 def check_confirmation_reaction(client_msg_id: str, chat_id: str | None = None) -> str | None:
     """Return 'yes' for 👍, 'no' for 👎/❌, else None on our message matching client_msg_id."""
@@ -104,7 +115,8 @@ def download_image(url: str) -> tuple[bytes, str] | None:
 def read(limit: int = 1, chat_id: str | None = None) -> list[dict]:
     res = _http.get(f"{_msg_url(chat_id)}?pageSize={limit}", headers=HEADERS, timeout=15)
     if not res.ok:
-        raise RuntimeError(f"Teams messages request failed with HTTP {res.status_code}")
+        hint = " (token expired? re-run with --setup)" if res.status_code == 401 else ""
+        raise RuntimeError(f"Teams messages request failed with HTTP {res.status_code}{hint}")
     return res.json().get("messages", [])
 
 if __name__ == "__main__":

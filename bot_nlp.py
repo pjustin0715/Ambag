@@ -104,13 +104,17 @@ def _strip_tags(raw: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     return re.sub(r"\n+", "\n", text).strip()
 
-def clean_teams_text(raw_text: str) -> str:
-    """Strip HTML tags/entities, preserving Teams reply <blockquote> context and line breaks."""
+def clean_teams_text(raw_text: str, msg_tasks: dict[str, list[str]] | None = None) -> str:
+    """Strip HTML tags/entities, preserving Teams reply <blockquote> context (+ linked tasks) and line breaks."""
     if not raw_text:
         return ""
     quote = ""
-    if m := re.search(r"<blockquote[^>]*>(.*?)</blockquote>", raw_text, flags=re.I | re.S):
-        quote = _strip_tags(m.group(1)).replace("\n", " ")[:180]
+    if m := re.search(r"<blockquote([^>]*)>(.*?)</blockquote>", raw_text, flags=re.I | re.S):
+        attrs, inner = m.group(1), m.group(2)
+        quote = _strip_tags(inner).replace("\n", " ")[:180]
+        if msg_tasks and (mid := re.search(r'\bitemid=["\']([^"\']+)["\']', attrs, flags=re.I)):
+            if linked := msg_tasks.get(mid.group(1)):
+                quote = f'{quote} (tasks: {", ".join(linked)})' if quote else f'tasks: {", ".join(linked)}'
         raw_text = raw_text[:m.start()] + raw_text[m.end():]
     body = _strip_tags(raw_text)
     if quote and body:
@@ -134,17 +138,23 @@ def looks_like_task(text: str, open_titles: list[str] | None = None) -> bool:
             return True
     return False
 
-def get_chat_text(limit: int = 10, chat_id: str | None = None) -> list[tuple[str, str, str, str, list[str]]]:
+def get_chat_text(limit: int = 10, chat_id: str | None = None, msg_tasks: dict[str, list[str]] | None = None) -> list[tuple[str, str, str, str, list[str]]]:
     """Cleaned human messages (oldest -> newest): [(msg_id, text, sender, sender_mri, img_urls), ...]."""
     messages = []
     for m in reversed(read(limit, chat_id=chat_id)):
+        if m.get("messagetype") not in ("Text", "RichText/Html"):
+            continue
+        if (m.get("properties") or {}).get("deletetime"):
+            continue
         raw = m.get("content", "")
+        # Strip quoted reply before scanning for images so replying to a photo doesn't re-OCR it
+        raw_no_quote = re.sub(r"<blockquote[^>]*>.*?</blockquote>", "", raw, flags=re.I | re.S)
         imgs = [
-            u for u in re.findall(r'<img[^>]+src="([^"]+)"', raw, flags=re.I)
+            u for u in re.findall(r'<img[^>]+src="([^"]+)"', raw_no_quote, flags=re.I)
             if not any(h in u.lower() for h in _SKIP_IMG_HINTS)
         ]
-        text = clean_teams_text(raw)
-        sender = m.get("imdisplayname") or m.get("fromGivenNameInToken") or ""
+        text = clean_teams_text(raw, msg_tasks=msg_tasks)
+        sender = (m.get("imdisplayname") or m.get("fromGivenNameInToken") or "").strip()
         sender_mri = (m.get("from") or "").rsplit("/", 1)[-1]
         if (text or imgs) and not text.startswith(BOT_PREFIX) and not any(sig in text for sig in _BOT_SIGNATURES):
             messages.append((m.get("id", ""), text, sender, sender_mri, imgs))

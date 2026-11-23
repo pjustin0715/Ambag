@@ -5,6 +5,8 @@ import json
 import base64
 import threading
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import date, datetime, timedelta
 from pydantic import BaseModel
 from google import genai
@@ -33,26 +35,58 @@ CHATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chats.jso
 
 
 _http = requests.Session()
-llm = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=20000))
+_http.mount("https://", HTTPAdapter(max_retries=Retry(total=3, connect=3, read=2, backoff_factor=0.3, allowed_methods=frozenset({"GET", "POST"}))))
+llm = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=20000)) if GEMINI_API_KEY else None
 notion = Client(auth=NOTION_TOKEN)
 _DB_INFO = notion.databases.retrieve(NOTION_DB_ID) if (NOTION_DB_ID and NOTION_DB_ID != "..." and "--setup" not in sys.argv) else {}
 DATA_SOURCE_ID = _DB_INFO["data_sources"][0]["id"] if _DB_INFO else ""
 _flowchart_block_id = None
 _pulse_block_id = None
+_sync_lock = threading.Lock()
+_chats_lock = threading.Lock()
 recent_by_chat: dict[str, deque] = {}  # chat_id -> deque[(task_name, assignee, sender)]
-open_tasks_by_chat: dict[str, list[str]] = {}  # chat_id -> active open task titles
-notion_state_by_chat: dict[str, dict[str, tuple[bool, str]]] = {}  # chat_id -> {page_id: (completed, last_edited)}
+open_tasks_by_chat: dict[str, list[tuple[str, str]]] = {}  # chat_id -> [(title, assignee)]
+notion_state_by_chat: dict[str, dict[str, tuple]] = {}  # chat_id -> {page_id: snapshot_tuple}
 
 
 def _get_recent(chat_id: str) -> deque:
     return recent_by_chat.setdefault(chat_id, deque(maxlen=20))
 
 
+def _first_name(raw: str | None, default: str = "Someone") -> str:
+    parts = (raw or "").strip().split()
+    return parts[0].capitalize() if parts else default
+
+
+def _valid_iso_date(val: str | None) -> bool:
+    if not val or len(val) != 10:
+        return False
+    try:
+        date.fromisoformat(val)
+        return True
+    except ValueError:
+        return False
+
+
+def _record_msg_tasks(cfg: dict, msg_ids: list[str], actions: list[dict]) -> bool:
+    """Map Teams message ID(s) -> created/assigned task names so replies to photos resolve accurately."""
+    names = [a["task"].strip() for a in actions if a.get("action") in ("create", "assign") and (a.get("task") or "").strip()]
+    if not names:
+        return False
+    mt = cfg.setdefault("msg_tasks", {})
+    for mid in msg_ids:
+        if mid:
+            mt[mid] = names
+    while len(mt) > 30:
+        mt.pop(next(iter(mt)))
+    return True
+
+
 def _record_member(cfg: dict, sender: str, mri: str) -> bool:
     """Cache sender's Teams MRI by first name for real push @mentions."""
-    if not sender or not mri or not mri.startswith("8:"):
+    first = _first_name(sender, "")
+    if not first or not mri or not mri.startswith("8:"):
         return False
-    first = sender.split()[0].capitalize()
     members = cfg.setdefault("members", {})
     if members.get(first.lower(), {}).get("mri") != mri:
         members[first.lower()] = {"mri": mri, "name": first}
@@ -62,7 +96,7 @@ def _record_member(cfg: dict, sender: str, mri: str) -> bool:
 
 def _mention(cfg: dict | None, raw_name: str) -> tuple[str, list[tuple[str, str]] | None]:
     """Return ('<at id="0">Name</at>', [(mri, Name)]) if MRI known, else ('@Name', None)."""
-    first = (raw_name or "Someone").strip().split()[0].capitalize()
+    first = _first_name(raw_name, "Someone")
     info = ((cfg or {}).get("members") or {}).get(first.lower())
     if info and info.get("mri"):
         return f'<at id="0">{first}</at>', [(info["mri"], first)]
@@ -102,8 +136,11 @@ def load_chats() -> dict:
 
 
 def save_chats(chats: dict):
-    with open(CHATS_FILE, "w") as f:
-        json.dump(chats, f, indent=2)
+    with _chats_lock:
+        tmp = CHATS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(chats, f, indent=2)
+        os.replace(tmp, CHATS_FILE)
 
 
 def provision_chat(chat_id: str, topic: str) -> dict:
@@ -134,6 +171,7 @@ def provision_chat(chat_id: str, topic: str) -> dict:
             }
         },
     )
+    safe_topic = topic.replace('"', "'").replace("\n", " ").strip() or "Project"
     created = notion.blocks.children.append(
         block_id=page["id"],
         children=[
@@ -150,7 +188,7 @@ def provision_chat(chat_id: str, topic: str) -> dict:
                 "type": "code",
                 "code": {
                     "language": "mermaid",
-                    "rich_text": [{"type": "text", "text": {"content": f'---\ntitle: "{topic}\'s Tasks"\n---\nflowchart LR\n    empty["No tasks yet"]'}}],
+                    "rich_text": [{"type": "text", "text": {"content": f'---\ntitle: "{safe_topic}\'s Tasks"\n---\nflowchart LR\n    empty["No tasks yet"]'}}],
                 },
             },
         ],
@@ -221,9 +259,16 @@ def _call_openai_compat(prompt: str, url: str, api_key: str, model: str, images:
     if not r.ok:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
     raw = (r.json()["choices"][0]["message"].get("content") or "").strip()
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.S).strip()
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        data = json.loads(raw[start:end + 1])
     actions = [a for a in data.get("actions", []) if a.get("action") != "ignore"]
     conf = float(data.get("ocr_confidence", 1.0)) if images else 1.0
     return actions, conf
@@ -244,7 +289,9 @@ def analyze_message(
     recent_str = ", ".join(
         f"'{t}' (assignee: {a or 'none'}, by: {s or 'unknown'})" for t, a, s in list(recent)[-5:]
     )
-    open_str = ", ".join(open_tasks_by_chat.get(cid, [])[:25]) or "none"
+    open_str = ", ".join(
+        f"'{t}' (assignee: {a or 'unassigned'})" for t, a in open_tasks_by_chat.get(cid, [])[:25]
+    ) or "none"
     last_sender_task = next(
         (t for t, _, s in reversed(recent) if s == sender),
         recent[-1][0] if recent else None,
@@ -264,8 +311,8 @@ def analyze_message(
         "Extract ALL task actions from the message and/or any attached whiteboard/notes image. Understand natural English, Tagalog, and colloquial Taglish (split across lines OR connectors like 'and', 'then', 'also', 'at', 'tapos', ',', ';'):\n"
         "- ocr_confidence: float 0.0-1.0 for attached images (1.0 if no image). Be strict: 0.95-1.0 ONLY for crisp typed/printed text; 0.75-0.89 for clear handwriting; 0.50-0.74 for messy/blurry/skewed handwriting; <0.50 if mostly illegible. Lower the score if ANY word, name, or date had to be guessed.\n"
         "- action:\n"
-        "  * 'assign': someone takes or is assigned a task (e.g. '[Name] will [task]', 'I will/can [task]', 'ako na sa [task]', 'ako na bahala sa [task]', 'si [Name] na sa [task]', 'kay [Name] yung [task]', '[task] - [Name] - [date]').\n"
-        "  * 'complete': task is finished/done or stated as already performed, including unhyphenated Taglish perfect tense (e.g. 'I have gone to class', 'tapos na', 'tapos ko na', 'naprint ko na', 'nasend na', 'nagawa ko na', 'napasa ko na', 'oks na', 'goods na', 'na-push ko na'). Strip prefixes like 'na-'/'nag-' so task name matches the base task (e.g. 'naprint ko na ang paper' -> task='print paper'). Note: 'g' / 'g na' means 'let's go', NOT complete.\n"
+        "  * 'assign': someone takes, is assigned, reassigns, or updates a task (e.g. '[Name] will [task]', 'I will/can [task]', 'ako na sa [task]', 'ako na bahala sa [task]', 'si [Name] na sa [task]', 'kay [Name] yung [task]', '[task] - [Name] - [date]'). Also use 'assign' when a reply reassigns or updates a quoted task in [Replying to: ...] (e.g. 'ako na pala dito', 'I'll take this', 'si [Name] na lang dito', 'sa Friday na lang pala'), using the task from [Replying to: ...].\n"
+        f"  * 'complete': task is finished/done or stated as already performed, including unhyphenated Taglish perfect tense (e.g. 'I have gone to class', 'tapos na', 'tapos ko na', 'naprint ko na', 'nasend na', 'nagawa ko na', 'napasa ko na', 'oks na', 'goods na', 'na-push ko na'). Strip prefixes like 'na-'/'nag-' so task name matches the base task (e.g. 'naprint ko na ang paper' -> task='print paper'). If the message just says 'done'/'finished'/'tapos na'/'oks na' without naming a task, prefer any task listed in [Replying to: ...] first; otherwise infer the open task assigned to '{sender}' from Active open tasks in Notion (or the only open task if unassigned). Set assignee=null for 'complete'. Note: 'g' / 'g na' means 'let's go', NOT complete.\n"
         "  * 'uncomplete': reopen a mistakenly completed task (e.g. 'reopen [task]', 'undo [task]', 'di pa pala tapos yung [task]', 'hindi pa tapos [task]').\n"
         "  * 'delete': cancel or remove a task (e.g. 'cancel [task]', 'delete [task]', 'remove [task]', 'wag na yung [task]', 'tanggalin yung [task]', 'burahin yung [task]').\n"
         "  * 'create': new task is created without assignment (e.g. 'kailangan gawin yung [task]').\n"
@@ -277,8 +324,8 @@ def analyze_message(
         "- task: Clean, concise task name (strip filler words like 'yung', 'ang', 'na', 'ko'). If referring to an existing task in Recent tasks or Active open tasks (even in another language, e.g. Tagalog vs English, or via a quoted [Replying to: ...] block), reuse that exact existing task name.\n"
         "- deadline: ISO 8601 (YYYY-MM-DD) or null. Resolve relative phrases using the calendar above: "
         "'today'/'ngayon'/'mamaya' = today; 'tomorrow'/'bukas'/'bkas' = +1 day; 'sa makalawa' = +2 days; "
-        "'this <day>'/'<day>'/'sa <day>'/'ngayong <day>' (lunes..linggo) = nearest upcoming <day>; "
-        "'next <day>'/'sa susunod na <day>' = <day> in the following calendar week (or +7 days from this <day>); "
+        "'this <day>'/'on <day>'/'<day>'/'sa <day>'/'ngayong <day>' (lunes..linggo) = today if today IS <day>, otherwise the nearest upcoming <day>; "
+        "'next <day>'/'sa susunod na <day>' = +7 days if today IS <day>, otherwise <day> in the following calendar week (or +7 days from this <day>); "
         "each extra 'next' (e.g. 'next next <day>') adds +7 days; "
         "'this week'/'ngayong linggo' = upcoming Friday (or Sunday if past Fri); 'next week'/'sa susunod na linggo' = Friday of next week; "
         "'in N days/weeks' = exact offset from today.\n"
@@ -309,28 +356,29 @@ def analyze_message(
             last_err = e
             print(f"[LLM Fallback] openrouter/free failed ({e}), trying Gemini...")
 
-    gemini_contents = [prompt, *[types.Part.from_bytes(data=b, mime_type=mime) for b, mime in images]] if images else prompt
-    for model, level in (
-        ("gemini-3.5-flash-lite", types.ThinkingLevel.MINIMAL),
-        ("gemini-3.8-flash", types.ThinkingLevel.LOW),
-        ("gemini-4-hydrogen", types.ThinkingLevel.LOW),
-    ):
-        try:
-            cfg = types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=TaskList,
-                temperature=0,
-                thinking_config=types.ThinkingConfig(thinking_level=level),
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-            )
-            res = llm.models.generate_content(model=model, contents=gemini_contents, config=cfg)
-            data = json.loads(res.text)
-            actions = [a for a in data.get("actions", []) if a.get("action") != "ignore"]
-            conf = float(data.get("ocr_confidence", 1.0)) if images else 1.0
-            return actions, conf
-        except Exception as e:
-            last_err = e
-            print(f"[LLM Fallback] {model} failed ({e}), trying next...")
+    if llm:
+        gemini_contents = [prompt, *[types.Part.from_bytes(data=b, mime_type=mime) for b, mime in images]] if images else prompt
+        for model, level in (
+            ("gemini-3.5-flash-lite", types.ThinkingLevel.MINIMAL),
+            ("gemini-3.8-flash", types.ThinkingLevel.LOW),
+            ("gemini-4-hydrogen", types.ThinkingLevel.LOW),
+        ):
+            try:
+                cfg = types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=TaskList,
+                    temperature=0,
+                    thinking_config=types.ThinkingConfig(thinking_level=level),
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                )
+                res = llm.models.generate_content(model=model, contents=gemini_contents, config=cfg)
+                data = json.loads(res.text or "")
+                actions = [a for a in data.get("actions", []) if a.get("action") != "ignore"]
+                conf = float(data.get("ocr_confidence", 1.0)) if images else 1.0
+                return actions, conf
+            except Exception as e:
+                last_err = e
+                print(f"[LLM Fallback] {model} failed ({e}), trying next...")
 
     if OPENROUTER_API_KEY:
         try:
@@ -338,31 +386,56 @@ def analyze_message(
         except Exception as e:
             last_err = e
             print(f"[LLM Fallback] openai/gpt-4o-mini failed ({e})")
-    raise last_err
+    raise last_err or RuntimeError("No LLM API keys configured in .env")
 
 # ================= NOTION DB =================
 
 
-def find_task(name: str, ds_id: str | None = None):
+def _query_all(ds_id: str, filter: dict | None = None) -> list[dict]:
+    """Query all pages from a Notion data source, following pagination cursors."""
+    results, cursor = [], None
+    while True:
+        kwargs = {"data_source_id": ds_id}
+        if filter is not None:
+            kwargs["filter"] = filter
+        if cursor:
+            kwargs["start_cursor"] = cursor
+        res = notion.data_sources.query(**kwargs)
+        results.extend(res.get("results", []))
+        if not res.get("has_more"):
+            break
+        cursor = res.get("next_cursor")
+    return results
+
+
+def _safe_title(page: dict) -> str:
+    tl = page.get("properties", {}).get("Task Name", {}).get("title", [])
+    return tl[0]["text"]["content"].strip() if tl else "Untitled"
+
+
+def _mermaid_escape(text: str) -> str:
+    return re.sub(r"\s+", " ", text).replace('"', "'").replace("<", "&lt;").replace(">", "&gt;").strip()
+
+
+def find_task(name: str, ds_id: str | None = None, prefer_completed: bool = False):
     if not name:
         return None
     ds = ds_id or DATA_SOURCE_ID
-    # 1. Exact match
-    res = notion.data_sources.query(data_source_id=ds, filter={
-                                    "property": "Task Name", "title": {"equals": name}})
-    if res.get("results"):
-        return res["results"][0]
+    # 1. Exact match (preferring the expected completion state if duplicates exist)
+    exact = _query_all(ds, filter={"property": "Task Name", "title": {"equals": name}})
+    if exact:
+        for p in exact:
+            if p["properties"].get("Completed", {}).get("checkbox", False) == prefer_completed:
+                return p
+        return exact[0]
 
-    # 2. NLP fuzzy match across active (uncompleted) tasks
-    open_tasks = notion.data_sources.query(data_source_id=ds, filter={
-                                           "property": "Completed", "checkbox": {"equals": False}})
-    match = match_task_candidate(name, open_tasks.get("results", []))
-    if match:
+    # 2. NLP fuzzy match across preferred completion state first
+    preferred = _query_all(ds, filter={"property": "Completed", "checkbox": {"equals": prefer_completed}})
+    if match := match_task_candidate(name, preferred):
         return match
 
     # 3. Fallback: check all tasks
-    all_tasks = notion.data_sources.query(data_source_id=ds)
-    return match_task_candidate(name, all_tasks.get("results", []))
+    return match_task_candidate(name, _query_all(ds))
 
 
 def _task_snapshot(tasks: list[dict]) -> dict[str, tuple]:
@@ -370,8 +443,7 @@ def _task_snapshot(tasks: list[dict]) -> dict[str, tuple]:
     snap = {}
     for t in tasks:
         props = t["properties"]
-        tl = props.get("Task Name", {}).get("title", [])
-        title = tl[0]["text"]["content"].strip() if tl else "Untitled"
+        title = _safe_title(t)
         if title.lower() == "task flowchart":
             continue
         done = props.get("Completed", {}).get("checkbox", False)
@@ -386,165 +458,171 @@ def _task_snapshot(tasks: list[dict]) -> dict[str, tuple]:
 def sync_flowchart(cfg: dict | None = None, tasks: list[dict] | None = None, chat_id: str | None = None):
     """Renders all Notion tasks + prerequisites into a native Notion Mermaid block + Project Pulse callout."""
     global _flowchart_block_id, _pulse_block_id
-    try:
-        ds = (cfg or {}).get("data_source_id") or DATA_SOURCE_ID
-        cid = chat_id or (None if cfg else bot_teams.CHAT_ID)
-        block_id = (cfg or {}).get("flowchart_block_id") or (None if cfg else _flowchart_block_id)
-        pulse_id = (cfg or {}).get("pulse_block_id") or (None if cfg else _pulse_block_id)
-        raw_tasks = tasks if tasks is not None else notion.data_sources.query(data_source_id=ds).get("results", [])
+    with _sync_lock:
+        try:
+            ds = (cfg or {}).get("data_source_id") or DATA_SOURCE_ID
+            cid = chat_id or (None if cfg else bot_teams.CHAT_ID)
+            block_id = (cfg or {}).get("flowchart_block_id") or (None if cfg else _flowchart_block_id)
+            pulse_id = (cfg or {}).get("pulse_block_id") or (None if cfg else _pulse_block_id)
+            raw_tasks = tasks if tasks is not None else _query_all(ds)
 
-        real_tasks = []
-        for t in raw_tasks:
-            tl = t["properties"].get("Task Name", {}).get("title", [])
-            title = tl[0]["text"]["content"].replace('"', "'") if tl else "Untitled"
-            if title.strip().lower() != "task flowchart":
-                real_tasks.append((t, title))
+            real_tasks = []
+            for t in raw_tasks:
+                title = _safe_title(t)
+                if title.lower() != "task flowchart":
+                    real_tasks.append((t, title))
 
-        done_ids = {t["id"] for t, _ in real_tasks if t["properties"].get("Completed", {}).get("checkbox", False)}
-        if cid:
-            open_tasks_by_chat[cid] = [title for t, title in real_tasks if t["id"] not in done_ids]
-            notion_state_by_chat[cid] = _task_snapshot(raw_tasks)
+            valid_ids = {t["id"] for t, _ in real_tasks}
+            done_ids = {t["id"] for t, _ in real_tasks if t["properties"].get("Completed", {}).get("checkbox", False)}
+            if cid:
+                snap = _task_snapshot(raw_tasks)
+                notion_state_by_chat[cid] = snap
+                open_tasks_by_chat[cid] = [(v[1], _first_name(v[2], "")) for v in snap.values() if not v[0]]
 
-        today = date.today()
-        chat_name = ((cfg or {}).get("name") or "Project").replace('"', "'").strip()
-        header = f"{chat_name}'s Tasks" if not chat_name.lower().endswith("tasks") else chat_name
-        lines = [
-            "---",
-            f'title: "{header}"',
-            "---",
-            "flowchart LR",
-            "    classDef done fill:#dcfce7,stroke:#15803d,stroke-width:1.5px,color:#111827,rx:8,ry:8;",
-            "    classDef overdue fill:#fee2e2,stroke:#dc2626,stroke-width:1.5px,color:#111827,rx:8,ry:8;",
-            "    classDef ready fill:#eff6ff,stroke:#2563eb,stroke-width:1.5px,color:#111827,rx:8,ry:8;",
-            "    classDef blocked fill:#f3f4f6,stroke:#9ca3af,stroke-width:1.5px,color:#4b5563,rx:8,ry:8;",
-        ]
-        if not real_tasks:
-            lines.append('    empty["No tasks yet"]')
+            today = date.today()
+            chat_name = _mermaid_escape((cfg or {}).get("name") or "Project")
+            header = f"{chat_name}'s Tasks" if not chat_name.lower().endswith("tasks") else chat_name
+            lines = [
+                "---",
+                f'title: "{header}"',
+                "---",
+                "flowchart LR",
+                "    classDef done fill:#dcfce7,stroke:#15803d,stroke-width:1.5px,color:#111827,rx:8,ry:8;",
+                "    classDef overdue fill:#fee2e2,stroke:#dc2626,stroke-width:1.5px,color:#111827,rx:8,ry:8;",
+                "    classDef ready fill:#eff6ff,stroke:#2563eb,stroke-width:1.5px,color:#111827,rx:8,ry:8;",
+                "    classDef blocked fill:#f3f4f6,stroke:#9ca3af,stroke-width:1.5px,color:#4b5563,rx:8,ry:8;",
+            ]
+            if not real_tasks:
+                lines.append('    empty["No tasks yet"]')
 
-        counts = {"done": 0, "ready": 0, "blocked": 0, "overdue": 0}
-        next_due = None  # (date, title, assignee)
-        for t, title in real_tasks:
-            nid = "n" + t["id"].replace("-", "")
-            props = t["properties"]
-            assignee_list = props.get("Assignee", {}).get("rich_text", [])
-            raw_assignee = assignee_list[0]["text"]["content"].strip() if assignee_list else ""
-            assignee = raw_assignee.split()[0].capitalize() if raw_assignee else "Unassigned"
+            counts = {"done": 0, "ready": 0, "blocked": 0, "overdue": 0}
+            next_due = None  # (date, title, assignee)
+            for t, title in real_tasks:
+                nid = "n" + t["id"].replace("-", "")
+                props = t["properties"]
+                assignee_list = props.get("Assignee", {}).get("rich_text", [])
+                raw_assignee = assignee_list[0]["text"]["content"].strip() if assignee_list else ""
+                assignee = _mermaid_escape(_first_name(raw_assignee, "Unassigned"))
 
-            deadline = (props.get("Deadline", {}).get("date") or {}).get("start", "")
-            dl_date, dl_str = None, ""
-            if deadline:
-                try:
-                    dl_date = date.fromisoformat(deadline[:10])
-                    dl_str = dl_date.strftime("%m/%d (%a)")
-                except ValueError:
-                    dl_str = deadline
+                deadline = (props.get("Deadline", {}).get("date") or {}).get("start", "")
+                dl_date, dl_str = None, ""
+                if deadline:
+                    try:
+                        dl_date = date.fromisoformat(deadline[:10])
+                        dl_str = dl_date.strftime("%m/%d (%a)")
+                    except ValueError:
+                        dl_str = _mermaid_escape(deadline)
 
-            prereq_ids = [pre["id"] for pre in props.get("Prerequisite", {}).get("relation", [])]
-            if t["id"] in done_ids:
-                cls = "done"
-            elif dl_date and dl_date < today:
-                cls = "overdue"
-            elif any(pid not in done_ids for pid in prereq_ids):
-                cls = "blocked"
-            else:
-                cls = "ready"
-            counts[cls] += 1
-            if cls != "done" and dl_date and (next_due is None or dl_date < next_due[0]):
-                next_due = (dl_date, title, assignee)
-
-            footer = f"{assignee} - {dl_str}" if dl_str else assignee
-            footer = footer.replace(" ", "\u00a0").replace("-", "\u2011")
-            card = f"<b>&nbsp;&nbsp;{title}&nbsp;&nbsp;</b><br/><hr/>{footer}"
-            lines.append(f'    {nid}["{card}"]:::{cls}')
-            for pid_raw in prereq_ids:
-                pid = "n" + pid_raw.replace("-", "")
-                lines.append(f"    {pid} --> {nid}")
-
-        total = len(real_tasks)
-        pct = int(round(counts["done"] * 100 / total)) if total else 0
-        pulse = (
-            f"Progress: {counts['done']}/{total} done ({pct}%) · "
-            f"Ready: {counts['ready']} · Blocked: {counts['blocked']} · Overdue: {counts['overdue']}"
-        )
-        if next_due:
-            pulse += f" · Next due: {next_due[1]} ({next_due[2]}, {next_due[0].strftime('%m/%d')})"
-
-        code_str = "\n".join(lines)
-        body = {
-            "language": "mermaid",
-            "rich_text": [{"type": "text", "text": {"content": code_str[i:i + 2000]}} for i in range(0, len(code_str), 2000)],
-        }
-
-        page_id = (cfg or {}).get("page_id")
-        if not block_id or not pulse_id:
-            if not page_id and (cfg or {}).get("db_id"):
-                page_id = notion.databases.retrieve(cfg["db_id"]).get("parent", {}).get("page_id")
-                if page_id and cfg is not None:
-                    cfg["page_id"] = page_id
-            if not page_id:
-                page_id = os.getenv("notion_flowchart_id", "").strip()
-            if not page_id:
-                res = notion.search(query="Task Flowchart").get("results", [])
-                pages = [r for r in res if r.get("object") == "page"]
-                page_id = pages[0]["id"] if pages else _DB_INFO.get("parent", {}).get("page_id")
-            if page_id:
-                for b in notion.blocks.children.list(block_id=page_id).get("results", []):
-                    if not block_id and b.get("type") == "code" and b.get("code", {}).get("language") == "mermaid":
-                        block_id = b["id"]
-                    elif not pulse_id and b.get("type") == "callout":
-                        pulse_id = b["id"]
-                if not pulse_id:
-                    created_p = notion.blocks.children.append(
-                        block_id=page_id,
-                        children=[{
-                            "object": "block",
-                            "type": "callout",
-                            "callout": {"rich_text": [{"type": "text", "text": {"content": pulse}}], "color": "gray_background"},
-                        }],
-                    )
-                    pulse_id = created_p["results"][0]["id"]
-                if cfg is not None:
-                    cfg["pulse_block_id"] = pulse_id
+                prereq_ids = [
+                    pre["id"] for pre in props.get("Prerequisite", {}).get("relation", [])
+                    if pre["id"] in valid_ids and pre["id"] != t["id"]
+                ]
+                if t["id"] in done_ids:
+                    cls = "done"
+                elif dl_date and dl_date < today:
+                    cls = "overdue"
+                elif any(pid not in done_ids for pid in prereq_ids):
+                    cls = "blocked"
                 else:
-                    _pulse_block_id = pulse_id
-                if not block_id:
-                    created = notion.blocks.children.append(
-                        block_id=page_id,
-                        children=[{"object": "block", "type": "code", "code": body}],
-                    )
-                    block_id = created["results"][0]["id"]
+                    cls = "ready"
+                counts[cls] += 1
+                if cls != "done" and dl_date and (next_due is None or dl_date < next_due[0]):
+                    next_due = (dl_date, title, assignee)
+
+                safe_title = _mermaid_escape(title)
+                footer = f"{assignee} - {dl_str}" if dl_str else assignee
+                footer = footer.replace(" ", "\u00a0").replace("-", "\u2011")
+                card = f"<b>&nbsp;&nbsp;{safe_title}&nbsp;&nbsp;</b><br/><hr/>{footer}"
+                lines.append(f'    {nid}["{card}"]:::{cls}')
+                for pid_raw in prereq_ids:
+                    pid = "n" + pid_raw.replace("-", "")
+                    lines.append(f"    {pid} --> {nid}")
+
+            total = len(real_tasks)
+            pct = int(round(counts["done"] * 100 / total)) if total else 0
+            pulse = (
+                f"Progress: {counts['done']}/{total} done ({pct}%) · "
+                f"Ready: {counts['ready']} · Blocked: {counts['blocked']} · Overdue: {counts['overdue']}"
+            )
+            if next_due:
+                pulse += f" · Next due: {next_due[1]} ({next_due[2]}, {next_due[0].strftime('%m/%d')})"
+
+            code_str = "\n".join(lines)
+            body = {
+                "language": "mermaid",
+                "rich_text": [{"type": "text", "text": {"content": code_str[i:i + 2000]}} for i in range(0, len(code_str), 2000)],
+            }
+
+            page_id = (cfg or {}).get("page_id")
+            if not block_id or not pulse_id:
+                if not page_id and (cfg or {}).get("db_id"):
+                    page_id = notion.databases.retrieve(cfg["db_id"]).get("parent", {}).get("page_id")
+                    if page_id and cfg is not None:
+                        cfg["page_id"] = page_id
+                if not page_id:
+                    page_id = os.getenv("notion_flowchart_id", "").strip()
+                if not page_id:
+                    res = notion.search(query="Task Flowchart").get("results", [])
+                    pages = [r for r in res if r.get("object") == "page"]
+                    page_id = pages[0]["id"] if pages else _DB_INFO.get("parent", {}).get("page_id")
+                if page_id:
+                    for b in notion.blocks.children.list(block_id=page_id).get("results", []):
+                        if not block_id and b.get("type") == "code" and b.get("code", {}).get("language") == "mermaid":
+                            block_id = b["id"]
+                        elif not pulse_id and b.get("type") == "callout":
+                            pulse_id = b["id"]
+                    if not pulse_id:
+                        created_p = notion.blocks.children.append(
+                            block_id=page_id,
+                            children=[{
+                                "object": "block",
+                                "type": "callout",
+                                "callout": {"rich_text": [{"type": "text", "text": {"content": pulse}}], "color": "gray_background"},
+                            }],
+                        )
+                        pulse_id = created_p["results"][0]["id"]
+                    if cfg is not None:
+                        cfg["pulse_block_id"] = pulse_id
+                    else:
+                        _pulse_block_id = pulse_id
+                    if not block_id:
+                        created = notion.blocks.children.append(
+                            block_id=page_id,
+                            children=[{"object": "block", "type": "code", "code": body}],
+                        )
+                        block_id = created["results"][0]["id"]
+                        if cfg is not None:
+                            cfg["flowchart_block_id"] = block_id
+                        else:
+                            _flowchart_block_id = block_id
+                        print("[Done] Created Mermaid flowchart in Notion")
+                        return
                     if cfg is not None:
                         cfg["flowchart_block_id"] = block_id
                     else:
                         _flowchart_block_id = block_id
-                    print("[Done] Created Mermaid flowchart in Notion")
-                    return
-                if cfg is not None:
-                    cfg["flowchart_block_id"] = block_id
-                else:
-                    _flowchart_block_id = block_id
 
-        if not block_id:
-            print("[Skip] Flowchart: create a Notion page 'Task Flowchart' (shared with integration) or set notion_flowchart_id in .env")
-            return
+            if not block_id:
+                print("[Skip] Flowchart: create a Notion page 'Task Flowchart' (shared with integration) or set notion_flowchart_id in .env")
+                return
 
-        if pulse_id:
-            notion.blocks.update(block_id=pulse_id, callout={"rich_text": [{"type": "text", "text": {"content": pulse}}]})
-        notion.blocks.update(block_id=block_id, code=body)
-        print("[Done] Synced Notion flowchart")
-    except Exception as e:
-        print(f"[Flowchart Error] {e}")
+            if pulse_id:
+                notion.blocks.update(block_id=pulse_id, callout={"rich_text": [{"type": "text", "text": {"content": pulse}}]})
+            notion.blocks.update(block_id=block_id, code=body)
+            print("[Done] Synced Notion flowchart")
+        except Exception as e:
+            print(f"[Flowchart Error] {e}")
 
 
 def _notify_dependents(page: dict, prev_sender: str, chat_id: str | None, cfg: dict | None, ds_id: str):
     """Notify assignees of open tasks whose prerequisite just completed."""
     prev_rt = page["properties"].get("Assignee", {}).get("rich_text", [])
-    prev_raw = (prev_rt[0]["text"]["content"].strip() if prev_rt else "") or prev_sender or "Someone"
-    prev_assignee = prev_raw.split()[0].capitalize()
-    prev_title = page["properties"]["Task Name"]["title"][0]["text"]["content"]
+    prev_raw = (prev_rt[0]["text"]["content"].strip() if prev_rt else "") or prev_sender
+    prev_assignee = _first_name(prev_raw, "Someone")
+    prev_title = _safe_title(page)
 
-    deps = notion.data_sources.query(
-        data_source_id=ds_id,
+    deps = _query_all(
+        ds_id,
         filter={
             "and": [
                 {"property": "Prerequisite", "relation": {"contains": page["id"]}},
@@ -553,13 +631,13 @@ def _notify_dependents(page: dict, prev_sender: str, chat_id: str | None, cfg: d
         },
     )
     state = notion_state_by_chat.get(chat_id or bot_teams.CHAT_ID, {})
-    for dep in deps.get("results", []):
+    for dep in deps:
         pre_rels = dep["properties"].get("Prerequisite", {}).get("relation", [])
-        if len(pre_rels) > 1 and any(not state.get(r["id"], (True, ""))[0] for r in pre_rels if r["id"] != page["id"]):
+        if len(pre_rels) > 1 and any(not state.get(r["id"], (True,))[0] for r in pre_rels if r["id"] != page["id"]):
             continue
         dep_rt = dep["properties"].get("Assignee", {}).get("rich_text", [])
         dep_raw = dep_rt[0]["text"]["content"].strip() if dep_rt else "Someone"
-        dep_name = dep["properties"]["Task Name"]["title"][0]["text"]["content"]
+        dep_name = _safe_title(dep)
         mention, mentions = _mention(cfg, dep_raw)
         bot_teams.send(
             f'Hey {mention}! {prev_assignee} just finished "{prev_title}", so you\'re all clear to start on "{dep_name}"!',
@@ -571,8 +649,9 @@ def _notify_dependents(page: dict, prev_sender: str, chat_id: str | None, cfg: d
 
 def handle_action(data: dict, sender: str = "", sync: bool = True, chat_id: str | None = None, cfg: dict | None = None) -> bool:
     action = data.get("action")
+    cid = chat_id or bot_teams.CHAT_ID
     if action in ("query_all", "query_person", "query_link"):
-        handle_query(action, data.get("assignee") or "", sender, chat_id or bot_teams.CHAT_ID, cfg or {})
+        handle_query(action, data.get("assignee") or "", sender, cid, cfg or {})
         return False
     task_name = (data.get("task") or "").strip()
     if not task_name:
@@ -581,16 +660,16 @@ def handle_action(data: dict, sender: str = "", sync: bool = True, chat_id: str 
     ds_id = (cfg or {}).get("data_source_id") or DATA_SOURCE_ID
 
     if action in ("create", "assign"):
-        page = find_task(task_name, ds_id)
+        page = find_task(task_name, ds_id, prefer_completed=False)
         props = {}
-        if data.get("assignee"):
-            props["Assignee"] = {"rich_text": [{"text": {"content": data["assignee"]}}]}
-        if data.get("deadline") and len(data["deadline"]) == 10 and data["deadline"][4] == "-" and data["deadline"][7] == "-":
+        if data.get("assignee") and str(data["assignee"]).strip():
+            props["Assignee"] = {"rich_text": [{"text": {"content": str(data["assignee"]).strip()}}]}
+        if _valid_iso_date(data.get("deadline")):
             props["Deadline"] = {"date": {"start": data["deadline"]}}
-        if data.get("prerequisite_task") and data["prerequisite_task"].lower() != (task_name or "").lower():
-            prereq = find_task(data["prerequisite_task"], ds_id)
+        if data.get("prerequisite_task") and data["prerequisite_task"].strip().lower() != task_name.lower():
+            prereq = find_task(data["prerequisite_task"].strip(), ds_id, prefer_completed=False)
             if prereq:
-                if page and _creates_cycle(page["id"], prereq["id"], notion.data_sources.query(data_source_id=ds_id).get("results", [])):
+                if page and _creates_cycle(page["id"], prereq["id"], _query_all(ds_id)):
                     print(f"[Skip] Blocked circular dependency: {data['prerequisite_task']} -> {task_name}")
                 else:
                     props["Prerequisite"] = {"relation": [{"id": prereq["id"]}]}
@@ -604,17 +683,20 @@ def handle_action(data: dict, sender: str = "", sync: bool = True, chat_id: str 
         else:
             props["Task Name"] = {"title": [{"text": {"content": task_name}}]}
             notion.pages.create(parent={"database_id": db_id}, properties=props)
-            assigned_str = f" assigned to {data['assignee']}" if data.get('assignee') else ""
+            assigned_str = f" assigned to {data['assignee']}" if data.get("assignee") else ""
             print(f"[Done] Created task: {task_name}{assigned_str}")
-        _get_recent(chat_id or bot_teams.CHAT_ID).append((task_name, data.get("assignee"), sender))
+        _get_recent(cid).append((task_name, data.get("assignee"), sender))
         if sync:
             sync_flowchart(cfg, chat_id=chat_id)
         return True
 
     elif action == "complete":
-        page = find_task(task_name, ds_id)
+        page = find_task(task_name, ds_id, prefer_completed=False)
         if page:
             notion.pages.update(page["id"], properties={"Completed": {"checkbox": True}})
+            with _sync_lock:
+                if cid in notion_state_by_chat and page["id"] in notion_state_by_chat[cid]:
+                    notion_state_by_chat[cid][page["id"]] = (True, *notion_state_by_chat[cid][page["id"]][1:])
             print(f"[Done] Completed task: {task_name}")
             if sync:
                 sync_flowchart(cfg, chat_id=chat_id)
@@ -623,7 +705,7 @@ def handle_action(data: dict, sender: str = "", sync: bool = True, chat_id: str 
         print(f"[Skip] Task not found to complete: {task_name}")
 
     elif action == "uncomplete":
-        page = find_task(task_name, ds_id)
+        page = find_task(task_name, ds_id, prefer_completed=True)
         if page:
             notion.pages.update(page["id"], properties={"Completed": {"checkbox": False}})
             print(f"[Done] Reopened task: {task_name}")
@@ -633,7 +715,7 @@ def handle_action(data: dict, sender: str = "", sync: bool = True, chat_id: str 
         print(f"[Skip] Task not found to reopen: {task_name}")
 
     elif action == "delete":
-        page = find_task(task_name, ds_id)
+        page = find_task(task_name, ds_id, prefer_completed=False)
         if page:
             notion.pages.update(page["id"], archived=True)
             print(f"[Done] Deleted task: {task_name}")
@@ -675,13 +757,13 @@ def handle_query(kind: str, target_name: str, sender: str, cid: str, cfg: dict):
         return
 
     ds = cfg.get("data_source_id") or DATA_SOURCE_ID
-    tasks = notion.data_sources.query(data_source_id=ds).get("results", [])
+    tasks = _query_all(ds)
     by_id = {t["id"]: t for t in tasks}
     done_ids = {t["id"] for t in tasks if t["properties"].get("Completed", {}).get("checkbox", False)}
     today = date.today()
-    first = (sender or "there").split()[0].capitalize()
-    sender_first = (sender or "").split()[0].lower() if sender else ""
-    target_first = (target_name or "").strip().split()[0].lower() if target_name else sender_first
+    first = _first_name(sender, "there")
+    sender_first = _first_name(sender, "").lower()
+    target_first = _first_name(target_name, "").lower() or sender_first
     is_self = (kind == "query_person") and (not target_first or target_first == sender_first)
     who_label = first if is_self else (target_first.capitalize() if target_first else "Someone")
 
@@ -690,13 +772,12 @@ def handle_query(kind: str, target_name: str, sender: str, cid: str, cfg: dict):
         if t["id"] in done_ids:
             continue
         props = t["properties"]
-        tl = props.get("Task Name", {}).get("title", [])
-        title = tl[0]["text"]["content"] if tl else "Untitled"
-        if title.strip().lower() == "task flowchart":
+        title = _safe_title(t)
+        if title.lower() == "task flowchart":
             continue
         ar = props.get("Assignee", {}).get("rich_text", [])
         raw_a = ar[0]["text"]["content"].strip() if ar else ""
-        assignee = raw_a.split()[0].capitalize() if raw_a else ""
+        assignee = _first_name(raw_a, "")
         if kind == "query_person" and (not target_first or target_first not in raw_a.lower()):
             continue
 
@@ -714,14 +795,13 @@ def handle_query(kind: str, target_name: str, sender: str, cid: str, cfg: dict):
         blockers = []
         for r in props.get("Prerequisite", {}).get("relation", []):
             pid = r["id"]
-            if pid in done_ids or pid not in by_id:
+            if pid in done_ids or pid not in by_id or pid == t["id"]:
                 continue
             p_props = by_id[pid]["properties"]
-            p_tl = p_props.get("Task Name", {}).get("title", [])
-            p_title = p_tl[0]["text"]["content"] if p_tl else "an earlier task"
+            p_title = _safe_title(by_id[pid])
             p_ar = p_props.get("Assignee", {}).get("rich_text", [])
             p_raw = p_ar[0]["text"]["content"].strip() if p_ar else ""
-            p_who = p_raw.split()[0].capitalize() if p_raw else ""
+            p_who = _first_name(p_raw, "")
             blockers.append(f'{p_who} to finish "{p_title}"' if p_who else f'"{p_title}"')
         blocker_str = " and ".join(blockers)
         is_overdue = bool(dl_date and dl_date < today)
@@ -803,8 +883,9 @@ def poll_notion_changes(cid: str, cfg: dict):
     if not ds:
         return
     try:
-        tasks = notion.data_sources.query(data_source_id=ds).get("results", [])
-        prev = notion_state_by_chat.get(cid)
+        tasks = _query_all(ds)
+        with _sync_lock:
+            prev = notion_state_by_chat.get(cid)
         if prev is None:
             sync_flowchart(cfg, tasks=tasks, chat_id=cid)
             return
@@ -822,64 +903,71 @@ def poll_notion_changes(cid: str, cfg: dict):
         print(f"[Notion Poll Error] {e}")
 
 
-def check_deadlines(chats: dict | None = None):
+def check_deadlines(chats: dict | None = None) -> bool:
     """Send @mention reminders for open tasks across all active chats (once per task per day)."""
     today = date.today()
     today_iso = today.isoformat()
     all_chats = chats if chats is not None else load_chats()
     changed = False
-    for cid, cfg in all_chats.items():
+    all_ok = True
+    for cid, cfg in list(all_chats.items()):
         if cfg.get("ignored") or not cfg.get("data_source_id"):
             continue
-        reminded = cfg.setdefault("reminded", {})
-        # Prune stale dates from earlier days
-        stale = [k for k, v in reminded.items() if v != today_iso]
-        for k in stale:
-            reminded.pop(k, None)
-            changed = True
-
-        open_tasks = notion.data_sources.query(
-            data_source_id=cfg["data_source_id"],
-            filter={"property": "Completed", "checkbox": {"equals": False}},
-        ).get("results", [])
-
-        for t in open_tasks:
-            if reminded.get(t["id"]) == today_iso:
-                continue
-            props = t["properties"]
-            deadline = (props.get("Deadline", {}).get("date") or {}).get("start", "")
-            if not deadline:
-                continue
-            try:
-                days_left = (date.fromisoformat(deadline[:10]) - today).days
-            except ValueError:
-                continue
-
-            title_list = props.get("Task Name", {}).get("title", [])
-            title = title_list[0]["text"]["content"] if title_list else "Untitled"
-            if title.lower() == "task flowchart":
-                continue
-            assignee_list = props.get("Assignee", {}).get("rich_text", [])
-            assignee = assignee_list[0]["text"]["content"].strip() if assignee_list else "Someone"
-            mention, mentions = _mention(cfg, assignee)
-
-            if days_left == 7:
-                msg = f'Hey {mention}, quick heads up, "{title}" is due in a week.'
-            elif days_left == 1:
-                msg = f'Hey {mention}, just a reminder that "{title}" is due tomorrow!'
-            elif days_left == 0:
-                msg = f'Hey {mention}, friendly nudge, "{title}" is due today!'
-            elif days_left < 0:
-                msg = f'Hey {mention}, heads up, "{title}" is past due!'
-            else:
-                continue
-
-            if bot_teams.send(msg, chat_id=cid, mentions=mentions):
-                reminded[t["id"]] = today_iso
+        try:
+            reminded = cfg.setdefault("reminded", {})
+            # Prune stale dates from earlier days
+            stale = [k for k, v in reminded.items() if v != today_iso]
+            for k in stale:
+                reminded.pop(k, None)
                 changed = True
-                print(f"[Reminder] Sent for '{title}' ({days_left}d) to {assignee}")
+
+            open_tasks = _query_all(
+                cfg["data_source_id"],
+                filter={"property": "Completed", "checkbox": {"equals": False}},
+            )
+
+            for t in open_tasks:
+                if reminded.get(t["id"]) == today_iso:
+                    continue
+                props = t["properties"]
+                deadline = (props.get("Deadline", {}).get("date") or {}).get("start", "")
+                if not deadline:
+                    continue
+                try:
+                    days_left = (date.fromisoformat(deadline[:10]) - today).days
+                except ValueError:
+                    continue
+
+                title = _safe_title(t)
+                if title.lower() == "task flowchart":
+                    continue
+                assignee_list = props.get("Assignee", {}).get("rich_text", [])
+                assignee = (assignee_list[0]["text"]["content"].strip() if assignee_list else "") or "Someone"
+                mention, mentions = _mention(cfg, assignee)
+
+                if days_left == 7:
+                    msg = f'Hey {mention}, quick heads up, "{title}" is due in a week.'
+                elif days_left == 1:
+                    msg = f'Hey {mention}, just a reminder that "{title}" is due tomorrow!'
+                elif days_left == 0:
+                    msg = f'Hey {mention}, friendly nudge, "{title}" is due today!'
+                elif days_left < 0:
+                    msg = f'Hey {mention}, heads up, "{title}" is past due!'
+                else:
+                    continue
+
+                if bot_teams.send(msg, chat_id=cid, mentions=mentions):
+                    reminded[t["id"]] = today_iso
+                    changed = True
+                    print(f"[Reminder] Sent for '{title}' ({days_left}d) to {assignee}")
+                else:
+                    all_ok = False
+        except Exception as e:
+            all_ok = False
+            print(f"[Reminder Error] {cfg.get('name', cid[:12])}: {e}")
     if changed:
         save_chats(all_chats)
+    return all_ok
 
 
 def run_setup():
@@ -925,8 +1013,14 @@ if __name__ == "__main__":
 
     print("Bot running... Polling for messages.")
     chats = load_chats()
-    seen_ids = set()
+    seen_ids: dict[str, None] = {}  # insertion-ordered for true FIFO eviction
     pending_confirm: dict[str, dict] = {}  # chat_id -> pending low-confidence OCR actions
+
+    def _mark_seen(mid: str):
+        if mid:
+            seen_ids[mid] = None
+            while len(seen_ids) > 500:
+                seen_ids.pop(next(iter(seen_ids)))
 
     # On startup, ignore pre-existing group chats not in chats.json so we don't spam old chats
     if NOTION_ROOT_PAGE_ID:
@@ -948,7 +1042,7 @@ if __name__ == "__main__":
         sync_flowchart(cfg, chat_id=cid)
         try:
             for msg_id, _, sender, sender_mri, _ in get_chat_text(10, chat_id=cid):
-                seen_ids.add(msg_id)
+                _mark_seen(msg_id)
                 _record_member(cfg, sender, sender_mri)
         except Exception as e:
             print(f"[Init Error] {cid}: {e}")
@@ -959,30 +1053,33 @@ if __name__ == "__main__":
     last_remind_date = None
     while True:
         try:
-            # Check for newly joined or renamed group chats every ~30s
-            if poll_count % 6 == 0:
-                for cid, topic in bot_teams.list_group_chats():
-                    if cid not in chats and NOTION_ROOT_PAGE_ID:
-                        chats[cid] = provision_chat(cid, topic)
-                        for msg_id, _, sender, sender_mri, _ in get_chat_text(10, chat_id=cid):
-                            seen_ids.add(msg_id)
-                            _record_member(chats[cid], sender, sender_mri)
-                        save_chats(chats)
-                    elif cid in chats and not chats[cid].get("ignored") and topic != chats[cid].get("name"):
-                        chats[cid]["name"] = topic
-                        pid = chats[cid].get("page_id")
-                        if not pid and chats[cid].get("db_id"):
-                            pid = notion.databases.retrieve(chats[cid]["db_id"]).get("parent", {}).get("page_id")
+            # Check for newly joined or renamed group chats every ~10s
+            if poll_count % 2 == 0:
+                try:
+                    for cid, topic in bot_teams.list_group_chats():
+                        if cid not in chats and NOTION_ROOT_PAGE_ID:
+                            chats[cid] = provision_chat(cid, topic)
+                            for msg_id, _, sender, sender_mri, _ in get_chat_text(10, chat_id=cid):
+                                _mark_seen(msg_id)
+                                _record_member(chats[cid], sender, sender_mri)
+                            save_chats(chats)
+                        elif cid in chats and not chats[cid].get("ignored") and topic != chats[cid].get("name"):
+                            chats[cid]["name"] = topic
+                            pid = chats[cid].get("page_id")
+                            if not pid and chats[cid].get("db_id"):
+                                pid = notion.databases.retrieve(chats[cid]["db_id"]).get("parent", {}).get("page_id")
+                                if pid:
+                                    chats[cid]["page_id"] = pid
                             if pid:
-                                chats[cid]["page_id"] = pid
-                        if pid:
-                            notion.pages.update(pid, properties={"title": [{"text": {"content": topic}}]})
-                            print(f"[Renamed] Notion page -> '{topic}'")
-                        save_chats(chats)
-                        threading.Thread(target=sync_flowchart, args=(chats[cid], None, cid), daemon=True).start()
+                                notion.pages.update(pid, properties={"title": [{"text": {"content": topic}}]})
+                                print(f"[Renamed] Notion page -> '{topic}'")
+                            save_chats(chats)
+                            threading.Thread(target=sync_flowchart, args=(chats[cid], None, cid), daemon=True).start()
+                except Exception as e:
+                    print(f"[Discovery Error] {e}")
 
-            # Two-way Notion sync every ~60s
-            if poll_count > 0 and poll_count % 12 == 0:
+            # Two-way Notion sync every ~10s
+            if poll_count > 0 and poll_count % 2 == 0:
                 for cid, cfg in list(chats.items()):
                     if not cfg.get("ignored"):
                         poll_notion_changes(cid, cfg)
@@ -990,100 +1087,123 @@ if __name__ == "__main__":
             # Built-in daily 9:00 AM deadline reminders (deduped per task/day in chats.json)
             now = datetime.now()
             if now.hour >= 9 and last_remind_date != now.date():
-                last_remind_date = now.date()
-                check_deadlines(chats)
+                if check_deadlines(chats):
+                    last_remind_date = now.date()
 
             poll_count += 1
 
             for cid, cfg in list(chats.items()):
                 if cfg.get("ignored"):
                     continue
+                try:
+                    # Check if a pending low-confidence OCR confirmation received 👍 or 👎/❌
+                    if cid in pending_confirm:
+                        choice = bot_teams.check_confirmation_reaction(pending_confirm[cid]["client_msg_id"], chat_id=cid)
+                        if choice == "yes":
+                            pend = pending_confirm.pop(cid)
+                            print(f"\n[Confirmed 👍] Committing {len(pend['actions'])} pending task(s) to Notion...")
+                            if any([handle_action(a, pend["sender"], sync=False, chat_id=cid, cfg=cfg) for a in pend["actions"]]):
+                                if _record_msg_tasks(cfg, [pend["orig_msg_id"]], pend["actions"]):
+                                    save_chats(chats)
+                                threading.Thread(target=sync_flowchart, args=(cfg, None, cid), daemon=True).start()
+                                bot_teams.react(pend["orig_msg_id"], chat_id=cid)
+                        elif choice == "no":
+                            pending_confirm.pop(cid)
+                            print("\n[Cancelled 👎] Discarded pending OCR draft")
+                            bot_teams.send("No worries, I scrapped that! Just drop the task here whenever you're ready.", chat_id=cid)
 
-                # Check if a pending low-confidence OCR confirmation received 👍 or 👎/❌
-                if cid in pending_confirm:
-                    choice = bot_teams.check_confirmation_reaction(pending_confirm[cid]["client_msg_id"], chat_id=cid)
-                    if choice == "yes":
-                        pend = pending_confirm.pop(cid)
-                        print(f"\n[Confirmed 👍] Committing {len(pend['actions'])} pending task(s) to Notion...")
-                        if any([handle_action(a, pend["sender"], sync=False, chat_id=cid, cfg=cfg) for a in pend["actions"]]):
+                    for msg_id, text, sender, sender_mri, img_urls in get_chat_text(10, chat_id=cid, msg_tasks=cfg.get("msg_tasks")):      # oldest -> newest
+                        if msg_id in seen_ids:
+                            continue
+                        if _record_member(cfg, sender, sender_mri):
+                            save_chats(chats)
+
+                        print(f"\n[{cfg.get('name', cid[:12])} | {sender or 'unknown'}] {text or '(image)'}" + (f" [{len(img_urls)} img]" if img_urls else ""))
+                        if not img_urls and cid not in pending_confirm and not looks_like_task(text, [t for t, _ in open_tasks_by_chat.get(cid, [])]):
+                            _mark_seen(msg_id)
+                            print("[Skip] No task signal")
+                            continue
+
+                        images = [d for u in img_urls if (d := bot_teams.download_image(u))]
+                        if img_urls and not images and not text:
+                            _mark_seen(msg_id)
+                            print("[Skip] Image download failed and no text")
+                            continue
+                        draft = pending_confirm[cid]["actions"] if (cid in pending_confirm and not images) else None
+                        actions, confidence = analyze_message(text, sender, images, chat_id=cid, pending_draft=draft)
+                        # Preserve unchanged fields (e.g. deadline) from pending OCR draft when user only patches one field
+                        if draft and actions:
+                            for i, a in enumerate(actions):
+                                if a.get("action") not in ("create", "assign"):
+                                    continue
+                                base = next(
+                                    (d for d in draft if (d.get("task") or "").lower() == (a.get("task") or "").lower()),
+                                    draft[i] if len(actions) == len(draft) else None,
+                                )
+                                if base:
+                                    for field in ("assignee", "deadline", "prerequisite_task"):
+                                        if not a.get(field) and base.get(field):
+                                            a[field] = base[field]
+                        # Deterministic chain when message starts with 'Tapos...'/'Then...'/'After...'/'Sunod...'
+                        if (
+                            actions
+                            and actions[0].get("action") in ("create", "assign")
+                            and not actions[0].get("prerequisite_task")
+                            and re.match(r"^\s*(tapos|then|after|afterwards|pagkatapos|sunod|kasunod|next)\b", text, re.I)
+                            and not re.match(r"^\s*tapos\s+(na|ko\s+na)\b", text, re.I)
+                        ):
+                            recent = _get_recent(cid)
+                            prev = next((t for t, _, s in reversed(recent) if s == sender), recent[-1][0] if recent else None)
+                            if prev and prev.lower() != (actions[0].get("task") or "").lower():
+                                actions[0]["prerequisite_task"] = prev
+                        if len(re.findall(r"^\s*\d+[.)]\s+", text, re.M)) >= 2 and len(actions) >= 2:
+                            for i in range(1, len(actions)):
+                                if (
+                                    actions[i].get("action") in ("create", "assign")
+                                    and actions[i - 1].get("action") in ("create", "assign")
+                                    and actions[i - 1].get("task")
+                                    and not actions[i].get("prerequisite_task")
+                                ):
+                                    actions[i]["prerequisite_task"] = actions[i - 1].get("task")
+                        _mark_seen(msg_id)
+                        needs_confirm = bool(images and confidence < OCR_CONFIDENCE_THRESHOLD)
+                        conf_tag = f" [OCR conf: {confidence:.2f}/{OCR_CONFIDENCE_THRESHOLD:.2f}]" if images else ""
+                        print(f"[Parsed actions] {actions}{conf_tag}")
+
+                        if needs_confirm:
+                            ocr_tasks = [a for a in actions if (a.get("task") or "").strip()]
+                            first_name = _first_name(sender, "there")
+                            bot_teams.react(msg_id, key="2753_questionmark", chat_id=cid)
+                            if ocr_tasks:
+                                summary = "<br/>".join(
+                                    f'• <b>{a["task"].strip()}</b>'
+                                    + (f' for {_first_name(a.get("assignee"), "")}' if _first_name(a.get("assignee"), "") else "")
+                                    + (f', due {a["deadline"]}' if a.get("deadline") else "")
+                                    + (f' (after "{a["prerequisite_task"]}")' if a.get("prerequisite_task") else "")
+                                    for a in ocr_tasks
+                                )
+                                ask = (
+                                    f"Hey {first_name}, that photo was a little tricky to read, here's what I got:<br/>"
+                                    f"{summary}<br/>"
+                                    "React with 👍 if that looks good, 👎 to scrap it, or just reply with any fixes!"
+                                )
+                                if confirm_cid := bot_teams.send(ask, chat_id=cid):
+                                    pending_confirm[cid] = {"client_msg_id": confirm_cid, "orig_msg_id": msg_id, "actions": ocr_tasks, "sender": sender}
+                            else:
+                                bot_teams.send(f"Hey {first_name}, I couldn't quite make out the writing in that photo, mind typing it out or sending a clearer shot?", chat_id=cid)
+                            continue
+
+                        resolved_pend = None
+                        if any(a.get("action") not in ("query_all", "query_person", "query_link") for a in actions):
+                            resolved_pend = pending_confirm.pop(cid, None)  # User replied with corrected tasks
+                        if any([handle_action(a, sender, sync=False, chat_id=cid, cfg=cfg) for a in actions]):
+                            linked_ids = [msg_id] + ([resolved_pend["orig_msg_id"]] if resolved_pend else [])
+                            if _record_msg_tasks(cfg, linked_ids, actions):
+                                save_chats(chats)
                             threading.Thread(target=sync_flowchart, args=(cfg, None, cid), daemon=True).start()
-                            bot_teams.react(pend["orig_msg_id"], chat_id=cid)
-                    elif choice == "no":
-                        pending_confirm.pop(cid)
-                        print("\n[Cancelled 👎] Discarded pending OCR draft")
-                        bot_teams.send("No worries, I scrapped that! Just drop the task here whenever you're ready.", chat_id=cid)
-
-                for msg_id, text, sender, sender_mri, img_urls in get_chat_text(10, chat_id=cid):      # oldest -> newest
-                    if msg_id in seen_ids:
-                        continue
-                    if _record_member(cfg, sender, sender_mri):
-                        save_chats(chats)
-
-                    print(f"\n[{cfg.get('name', cid[:12])} | {sender or 'unknown'}] {text or '(image)'}" + (f" [{len(img_urls)} img]" if img_urls else ""))
-                    if not img_urls and cid not in pending_confirm and not looks_like_task(text, open_tasks_by_chat.get(cid)):
-                        seen_ids.add(msg_id)
-                        print("[Skip] No task signal")
-                        continue
-
-                    images = [d for u in img_urls if (d := bot_teams.download_image(u))]
-                    if img_urls and not images and not text:
-                        seen_ids.add(msg_id)
-                        print("[Skip] Image download failed and no text")
-                        continue
-                    draft = pending_confirm[cid]["actions"] if (cid in pending_confirm and not images) else None
-                    actions, confidence = analyze_message(text, sender, images, chat_id=cid, pending_draft=draft)
-                    # Deterministic chain when message starts with 'Tapos...'/'Then...'/'After...'/'Sunod...'
-                    if (
-                        actions
-                        and actions[0].get("action") in ("create", "assign")
-                        and not actions[0].get("prerequisite_task")
-                        and re.match(r"^\s*(tapos|then|after|afterwards|pagkatapos|sunod|kasunod|next)\b", text, re.I)
-                        and not re.match(r"^\s*tapos\s+(na|ko\s+na)\b", text, re.I)
-                    ):
-                        recent = _get_recent(cid)
-                        prev = next((t for t, _, s in reversed(recent) if s == sender), recent[-1][0] if recent else None)
-                        if prev and prev.lower() != (actions[0].get("task") or "").lower():
-                            actions[0]["prerequisite_task"] = prev
-                    if len(re.findall(r"^\s*\d+[.)]\s+", text, re.M)) >= 2 and len(actions) >= 2:
-                        for i in range(1, len(actions)):
-                            if not actions[i].get("prerequisite_task"):
-                                actions[i]["prerequisite_task"] = actions[i - 1].get("task")
-                    seen_ids.add(msg_id)
-                    if len(seen_ids) > 500:
-                        seen_ids.pop()
-                    needs_confirm = bool(images and confidence < OCR_CONFIDENCE_THRESHOLD)
-                    conf_tag = f" [OCR conf: {confidence:.2f}/{OCR_CONFIDENCE_THRESHOLD:.2f}]" if images else ""
-                    print(f"[Parsed actions] {actions}{conf_tag}")
-
-                    if needs_confirm and actions:
-                        bot_teams.react(msg_id, key="2753_questionmark", chat_id=cid)
-                        first_name = (sender or "there").split()[0].capitalize()
-                        summary = "<br/>".join(
-                            f'• <b>{a["task"]}</b>'
-                            + (f' for {a["assignee"].split()[0].capitalize()}' if a.get("assignee") else "")
-                            + (f', due {a["deadline"]}' if a.get("deadline") else "")
-                            + (f' (after "{a["prerequisite_task"]}")' if a.get("prerequisite_task") else "")
-                            for a in actions
-                        )
-                        ask = (
-                            f"Hey {first_name}, that photo was a little tricky to read, here's what I got:<br/>"
-                            f"{summary}<br/>"
-                            "React with 👍 if that looks good, 👎 to scrap it, or just reply with any fixes!"
-                        )
-                        if confirm_cid := bot_teams.send(ask, chat_id=cid):
-                            pending_confirm[cid] = {"client_msg_id": confirm_cid, "orig_msg_id": msg_id, "actions": actions, "sender": sender}
-                        continue
-                    elif needs_confirm:
-                        bot_teams.react(msg_id, key="2753_questionmark", chat_id=cid)
-                        first_name = (sender or "there").split()[0].capitalize()
-                        bot_teams.send(f"Hey {first_name}, I couldn't quite make out the writing in that photo, mind typing it out or sending a clearer shot?", chat_id=cid)
-                        continue
-
-                    if any(a.get("action") not in ("query_all", "query_person", "query_link") for a in actions):
-                        pending_confirm.pop(cid, None)  # User replied with corrected tasks
-                    if any([handle_action(a, sender, sync=False, chat_id=cid, cfg=cfg) for a in actions]):
-                        threading.Thread(target=sync_flowchart, args=(cfg, None, cid), daemon=True).start()
-                        bot_teams.react(msg_id, chat_id=cid)
+                            bot_teams.react(msg_id, chat_id=cid)
+                except Exception as e:
+                    print(f"[Chat Error] {cfg.get('name', cid[:12])}: {e}")
         except Exception as e:
             print(f"Error: {e}")
 
