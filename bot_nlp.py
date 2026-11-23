@@ -48,7 +48,13 @@ TASK_SIGNALS = {
 }
 
 TAGLISH_RE = re.compile(
-    r"\b(ako\s+na|si\s+\w+\s+na|kay\s+\w+|(mag|nag|pag|ni|na|in|ipa)-[a-z]+)\b",
+    r"\b("
+    r"ako\s+na|si\s+\w+\s+na|kay\s+\w+|"
+    r"(ko|mo|namin|natin|nila)\s+na|"
+    r"(mag|nag|pag|ni|na|in|ipa)-[a-z]+|"
+    r"(mag|nag|nai|naka|nakapag)[a-z]{3,}|"
+    r"na[a-z]{3,}\s+(na|ko|ni|yung|ung|ang)"
+    r")\b",
     re.I,
 )
 
@@ -144,6 +150,8 @@ if __name__ == "__main__":
         "nag-push na ko ng code",
         "sa makalawa yung draft",
         "kay steven yung wiring",
+        "naprint ko na ang paper",
+        "nasend na yung slides",
     ):
         assert looks_like_task(msg), f"Should pass looks_like_task: {msg}"
     for chatter in ("haha oo nga eh", "kain muna tayo", "sige g", "gutom na ako"):

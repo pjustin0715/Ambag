@@ -110,7 +110,14 @@ def provision_chat(chat_id: str, topic: str) -> dict:
         "data_source_id": ds_id,
         "flowchart_block_id": created["results"][0]["id"],
     }
-    bot_teams.send(f'Hi! Your task tracker & flowchart is ready: {page["url"]}', chat_id=chat_id)
+    welcome = (
+        f'Hi! Your task tracker & flowchart is ready: {page["url"]}<br/><br/>'
+        "<b>Data & Privacy Notice:</b> By keeping Ambag in this group chat, task-related messages and shared planning images "
+        "are processed via external AI APIs (Groq / OpenRouter / Gemini) solely to extract tasks, assignees, deadlines, and dependencies "
+        "into your Notion tracker. Casual chatter is filtered locally and raw chat logs are not saved to Notion. "
+        "Remove this bot from the chat anytime to stop monitoring."
+    )
+    bot_teams.send(welcome, chat_id=chat_id)
     print(f"[Provisioned] '{topic}' -> {page['url']}")
     return cfg
 
@@ -189,7 +196,7 @@ def analyze_message(text: str, sender: str = "", images: list[tuple[bytes, str]]
         "- ocr_confidence: float 0.0-1.0 for attached images (1.0 if no image). Be strict: 0.95-1.0 ONLY for crisp typed/printed text; 0.75-0.89 for clear handwriting; 0.50-0.74 for messy/blurry/skewed handwriting; <0.50 if mostly illegible. Lower the score if ANY word, name, or date had to be guessed.\n"
         "- action:\n"
         "  * 'assign': someone takes or is assigned a task (e.g. '[Name] will [task]', 'I will/can [task]', 'ako na sa [task]', 'ako na bahala sa [task]', 'si [Name] na sa [task]', 'kay [Name] yung [task]', '[task] - [Name] - [date]').\n"
-        "  * 'complete': task is finished/done or stated as already performed (e.g. 'I have gone to class', 'tapos na', 'tapos ko na', 'tpos na', 'nagawa ko na', 'napasa ko na', 'oks na', 'goods na', 'na-push ko na'). Note: 'g' / 'g na' means 'let's go', NOT complete.\n"
+        "  * 'complete': task is finished/done or stated as already performed, including unhyphenated Taglish perfect tense (e.g. 'I have gone to class', 'tapos na', 'tapos ko na', 'naprint ko na', 'nasend na', 'nagawa ko na', 'napasa ko na', 'oks na', 'goods na', 'na-push ko na'). Strip prefixes like 'na-'/'nag-' so task name matches the base task (e.g. 'naprint ko na ang paper' -> task='print paper'). Note: 'g' / 'g na' means 'let's go', NOT complete.\n"
         "  * 'create': new task is created without assignment (e.g. 'kailangan gawin yung [task]').\n"
         "  * 'ignore': casual chatter or no task action.\n"
         f"- assignee: Person assigned. If first-person ('I', 'me', 'myself', 'ako', 'ko', 'akin', 'sakin', 'ako na'), use sender '{sender}'. Only set if explicitly stated, else null.\n"
@@ -202,7 +209,7 @@ def analyze_message(text: str, sender: str = "", images: list[tuple[bytes, str]]
         "'this week'/'ngayong linggo' = upcoming Friday (or Sunday if past Fri); 'next week'/'sa susunod na linggo' = Friday of next week; "
         "'in N days/weeks' = exact offset from today.\n"
         "- prerequisite_task: Clean underlying task name only (e.g. if 'after Steven is done eating' or 'pagkatapos kumain ni Steven', prerequisite_task is 'eat'/'kumain'). "
-        f"Sequential/conditional connectors ('then', 'once', 'before', 'after', 'afterwards', 'pagkatapos', 'kapag tapos na', 'pag tapos na', 'bago', 'sunod', or 'tapos' used as 'then') link tasks: in 'A then B' or 'A tapos B', B's prerequisite_task is A; if no task is named after 'after'/'then'/'pagkatapos', use '{last_sender_task or 'null'}' (or the previous task in this message). "
+        f"Sequential/conditional connectors ('then', 'once', 'before', 'after', 'afterwards', 'pagkatapos', 'kapag tapos na', 'pag tapos na', 'bago', 'sunod', 'kasunod', or 'tapos' used as 'then') link tasks: in 'A then B' or 'A tapos B', B's prerequisite_task is A; if a message starts with or ends with 'after'/'then'/'tapos'/'pagkatapos'/'sunod' with no task named, ALWAYS set prerequisite_task to '{last_sender_task or 'null'}' (or the previous task in this message). "
         "If it says 'after [Person]' / 'pagkatapos ni [Person]', use [Person]'s most recent task from Recent tasks above or earlier in this message. "
         "If tasks are numbered in order (e.g. '1. A', '2. B', '3. C' in text or image), strip the numbers from task names and chain each item's prerequisite_task to the previous numbered task (unless another prerequisite is stated). "
         "Do NOT include person names or status phrases like 'is done'/'tapos na'/'after', and NEVER set prerequisite_task to the task itself.\n"
@@ -606,6 +613,18 @@ if __name__ == "__main__":
 
                     images = [d for u in img_urls if (d := bot_teams.download_image(u))]
                     actions, confidence = analyze_message(text, sender, images, chat_id=cid)
+                    # Deterministic chain when message starts with 'Tapos...'/'Then...'/'After...'/'Sunod...'
+                    if (
+                        actions
+                        and actions[0].get("action") in ("create", "assign")
+                        and not actions[0].get("prerequisite_task")
+                        and re.match(r"^\s*(tapos|then|after|afterwards|pagkatapos|sunod|kasunod|next)\b", text, re.I)
+                        and not re.match(r"^\s*tapos\s+(na|ko\s+na)\b", text, re.I)
+                    ):
+                        recent = _get_recent(cid)
+                        prev = next((t for t, _, s in reversed(recent) if s == sender), recent[-1][0] if recent else None)
+                        if prev and prev.lower() != (actions[0].get("task") or "").lower():
+                            actions[0]["prerequisite_task"] = prev
                     if len(re.findall(r"^\s*\d+[.)]\s+", text, re.M)) >= 2 and len(actions) >= 2:
                         for i in range(1, len(actions)):
                             if not actions[i].get("prerequisite_task"):
