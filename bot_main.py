@@ -104,6 +104,7 @@ def provision_chat(chat_id: str, topic: str) -> dict:
     )
     cfg = {
         "name": topic,
+        "page_id": page["id"],
         "page_url": page["url"],
         "db_id": db["id"],
         "data_source_id": ds_id,
@@ -290,7 +291,12 @@ def sync_flowchart(cfg: dict | None = None):
         ds = (cfg or {}).get("data_source_id") or DATA_SOURCE_ID
         block_id = (cfg or {}).get("flowchart_block_id") or (None if cfg else _flowchart_block_id)
         tasks = notion.data_sources.query(data_source_id=ds).get("results", [])
+        chat_name = ((cfg or {}).get("name") or "Project").replace('"', "'").strip()
+        header = f"{chat_name}'s Tasks" if not chat_name.lower().endswith("tasks") else chat_name
         lines = [
+            "---",
+            f'title: "{header}"',
+            "---",
             "flowchart LR",
             "    classDef done fill:#dcfce7,stroke:#111827,stroke-width:1.5px,color:#111827,rx:8,ry:8;",
             "    classDef todo fill:#e5e7eb,stroke:#111827,stroke-width:1.5px,color:#111827,rx:8,ry:8;",
@@ -554,14 +560,26 @@ if __name__ == "__main__":
     poll_count = 0
     while True:
         try:
-            # Check for newly joined group chats every ~30s
-            if NOTION_ROOT_PAGE_ID and poll_count % 6 == 0:
+            # Check for newly joined or renamed group chats every ~30s
+            if poll_count % 6 == 0:
                 for cid, topic in bot_teams.list_group_chats():
-                    if cid not in chats:
+                    if cid not in chats and NOTION_ROOT_PAGE_ID:
                         chats[cid] = provision_chat(cid, topic)
                         save_chats(chats)
                         for msg_id, _, _, _ in get_chat_text(10, chat_id=cid):
                             seen_ids.add(msg_id)
+                    elif cid in chats and not chats[cid].get("ignored") and topic != chats[cid].get("name"):
+                        chats[cid]["name"] = topic
+                        pid = chats[cid].get("page_id")
+                        if not pid and chats[cid].get("db_id"):
+                            pid = notion.databases.retrieve(chats[cid]["db_id"]).get("parent", {}).get("page_id")
+                            if pid:
+                                chats[cid]["page_id"] = pid
+                        if pid:
+                            notion.pages.update(pid, properties={"title": [{"text": {"content": topic}}]})
+                            print(f"[Renamed] Notion page -> '{topic}'")
+                        save_chats(chats)
+                        threading.Thread(target=sync_flowchart, args=(chats[cid],), daemon=True).start()
             poll_count += 1
 
             for cid, cfg in list(chats.items()):
