@@ -1,3 +1,4 @@
+import json
 import time
 import requests
 import os
@@ -7,7 +8,7 @@ load_dotenv()
 _http = requests.Session()
 TOKEN = os.getenv('teams_token', '')
 MEDIA_TOKEN = os.getenv('teams_media_token', '').strip()
-CHAT_ID = os.getenv('teams_chat_id', '19:253e041a-5f7f-4f21-88b1-2b349a351a53_4c107e33-2a08-4a96-8c8d-f081a3c2bab8@unq.gbl.spaces')
+CHAT_ID = os.getenv('teams_chat_id', '').strip()
 BASE_URL = "https://teams.cloud.microsoft/api/chatsvc/apac/v1/users/ME/conversations"
 URL = f"{BASE_URL}/{CHAT_ID}/messages"
 if TOKEN.lower().startswith('skypetoken='):
@@ -33,7 +34,7 @@ def list_group_chats(limit: int = 30) -> list[tuple[str, str]]:
     return chats
 
 # ponytail: minimal payload; Teams only strictly requires content, type, and a unique client ID
-def send(text: str, chat_id: str | None = None) -> str | None:
+def send(text: str, chat_id: str | None = None, mentions: list[tuple[str, str]] | None = None) -> str | None:
     client_id = str(int(time.time() * 1000))
     payload = {
         "content": f"<p>{text}</p>",
@@ -41,16 +42,38 @@ def send(text: str, chat_id: str | None = None) -> str | None:
         "contenttype": "Text",
         "clientmessageid": client_id,
     }
+    if mentions:
+        payload["properties"] = {
+            "mentions": json.dumps([
+                {
+                    "@type": "http://schema.skype.com/Mention",
+                    "itemid": str(i),
+                    "mri": mri,
+                    "mentionType": "person",
+                    "displayName": name,
+                }
+                for i, (mri, name) in enumerate(mentions)
+            ])
+        }
     ok = _http.post(_msg_url(chat_id), headers=HEADERS, json=payload, timeout=15).status_code in (200, 201)
     return client_id if ok else None
 
-def has_thumbs_up(client_msg_id: str, chat_id: str | None = None) -> bool:
-    """Return True if anyone reacted 👍 ('like') to our message matching client_msg_id."""
+def check_confirmation_reaction(client_msg_id: str, chat_id: str | None = None) -> str | None:
+    """Return 'yes' for 👍, 'no' for 👎/❌, else None on our message matching client_msg_id."""
     for m in read(15, chat_id=chat_id):
         if m.get("clientmessageid") == client_msg_id or m.get("id") == client_msg_id:
             emotions = (m.get("properties") or {}).get("emotions") or []
-            return any(e.get("key") in ("like", "👍", "1f44d_thumbsup") and e.get("users") for e in emotions)
-    return False
+            for e in emotions:
+                if not e.get("users"):
+                    continue
+                if e.get("key") in ("like", "👍", "1f44d_thumbsup"):
+                    return "yes"
+                if e.get("key") in ("dislike", "👎", "1f44e_thumbsdown", "❌", "274c_crossmark"):
+                    return "no"
+    return None
+
+def has_thumbs_up(client_msg_id: str, chat_id: str | None = None) -> bool:
+    return check_confirmation_reaction(client_msg_id, chat_id=chat_id) == "yes"
 
 def react(msg_id: str, key: str = "2705_whiteheavycheckmark", chat_id: str | None = None) -> bool:
     """Add an emoji reaction to a Teams message via chatsvc."""

@@ -45,7 +45,36 @@ TASK_SIGNALS = {
     "kunin", "ipasa", "pasa", "pwede", "pede", "tapos", "tpos", "natapos",
     "napasa", "nasubmit", "oks", "goods", "pagkatapos", "sunod", "kasunod",
     "bago", "hanggang", "kapag", "pag", "tapusin",
+    # Cancellation / reopening signals
+    "cancel", "cancelled", "delete", "remove", "drop", "reopen", "undo",
+    "wag", "huwag", "bawi", "tanggalin", "burahin", "di", "hindi",
+    # Conversational status / link query cues
+    "tasks", "status", "left", "pending", "remaining", "kulang", "link", "notion", "tracker",
 }
+
+_SKIP_IMG_HINTS = ("emoticon", "emoji", "giphy", "tenor", "sticker")
+_BOT_SIGNATURES = (
+    "I'll help keep track of your tasks",
+    "all clear to start on",
+    "quick heads up,",
+    "just a reminder that",
+    "friendly nudge,",
+    "heads up,",
+    "tricky to read",
+    "couldn't quite make out the writing",
+    "No worries, I scrapped that",
+    "Notion tracker for this chat",
+    "Notion tracker link saved",
+    "all caught up",
+    "wrap that up soon!",
+    "still waiting on",
+    "left on your plate:",
+    "still has left:",
+    "Here's where we're at,",
+    "We just have one task left:",
+    'you just have "',
+    'just has "',
+)
 
 TAGLISH_RE = re.compile(
     r"\b("
@@ -68,37 +97,57 @@ DATE_RE = re.compile(
     re.I,
 )
 
-def clean_teams_text(raw_text: str) -> str:
-    """Strip HTML tags/entities and preserve line breaks."""
-    if not raw_text:
-        return ""
-    text = re.sub(r"<br\s*/?>|</p>|</div>|</li>", "\n", raw_text, flags=re.I)
+def _strip_tags(raw: str) -> str:
+    text = re.sub(r"<br\s*/?>|</p>|</div>|</li>", "\n", raw, flags=re.I)
     text = re.sub(r"<[^>]+>", "", text)
     text = html.unescape(text).replace("\xa0", " ")
     text = re.sub(r"[ \t]+", " ", text)
     return re.sub(r"\n+", "\n", text).strip()
 
-def looks_like_task(text: str) -> bool:
-    """Pre-filter: True if message contains English/Tagalog task cues, dates, or lists."""
+def clean_teams_text(raw_text: str) -> str:
+    """Strip HTML tags/entities, preserving Teams reply <blockquote> context and line breaks."""
+    if not raw_text:
+        return ""
+    quote = ""
+    if m := re.search(r"<blockquote[^>]*>(.*?)</blockquote>", raw_text, flags=re.I | re.S):
+        quote = _strip_tags(m.group(1)).replace("\n", " ")[:180]
+        raw_text = raw_text[:m.start()] + raw_text[m.end():]
+    body = _strip_tags(raw_text)
+    if quote and body:
+        return f'[Replying to: "{quote}"]\n{body}'
+    return body or quote
+
+def looks_like_task(text: str, open_titles: list[str] | None = None) -> bool:
+    """Pre-filter: True if message has EN/TL task cues, dates, lists, or mentions an active open task."""
     words = set(re.findall(r"[a-z']+", text.lower()))
-    return (
+    if (
         bool(words & TASK_SIGNALS)
         or bool(TAGLISH_RE.search(text))
         or bool(DATE_RE.search(text))
         or ("\n" in text and " - " in text)
         or bool(re.search(r"^\s*\d+[.)]\s+\w+", text, re.M))
-    )
+    ):
+        return True
+    if open_titles:
+        msg_tokens = normalize_tokens(text)
+        if msg_tokens and any(msg_tokens & normalize_tokens(t) for t in open_titles):
+            return True
+    return False
 
-def get_chat_text(limit: int = 10, chat_id: str | None = None) -> list[tuple[str, str, str, list[str]]]:
-    """Cleaned human messages (oldest -> newest): [(msg_id, text, sender, img_urls), ...]."""
+def get_chat_text(limit: int = 10, chat_id: str | None = None) -> list[tuple[str, str, str, str, list[str]]]:
+    """Cleaned human messages (oldest -> newest): [(msg_id, text, sender, sender_mri, img_urls), ...]."""
     messages = []
     for m in reversed(read(limit, chat_id=chat_id)):
         raw = m.get("content", "")
-        imgs = [u for u in re.findall(r'<img[^>]+src="([^"]+)"', raw, flags=re.I) if "emoticon" not in u.lower() and "emoji" not in u.lower()]
+        imgs = [
+            u for u in re.findall(r'<img[^>]+src="([^"]+)"', raw, flags=re.I)
+            if not any(h in u.lower() for h in _SKIP_IMG_HINTS)
+        ]
         text = clean_teams_text(raw)
         sender = m.get("imdisplayname") or m.get("fromGivenNameInToken") or ""
-        if (text or imgs) and not text.startswith(BOT_PREFIX) and "just a reminder, your task" not in text and "You can start with your task" not in text and "Your task tracker & flowchart is ready:" not in text and "that image was a bit hard to read!" not in text and "couldn't quite make out the writing" not in text:
-            messages.append((m.get("id", ""), text, sender, imgs))
+        sender_mri = (m.get("from") or "").rsplit("/", 1)[-1]
+        if (text or imgs) and not text.startswith(BOT_PREFIX) and not any(sig in text for sig in _BOT_SIGNATURES):
+            messages.append((m.get("id", ""), text, sender, sender_mri, imgs))
     return messages
 
 def normalize_tokens(text: str) -> set[str]:
@@ -159,4 +208,8 @@ if __name__ == "__main__":
     assert task_similarity("ni-review na pr", "review pr") == 1.0
     assert task_similarity("yung slides ko", "slides") == 1.0
     assert task_similarity("gawin yung paper", "gawin yung draft") < 0.75
-    print("bot_nlp Taglish self-check passed!")
+    assert looks_like_task("slides ok na", open_titles=["make slides"])
+    for q in ("ano pa kulang?", "ano gagawin ni steven?", "what tasks do i have left?", "asan yung notion link?"):
+        assert looks_like_task(q), f"Query should pass looks_like_task: {q}"
+    assert '[Replying to: "draft intro"]' in clean_teams_text("<blockquote><p>draft intro</p></blockquote><p>ako na</p>")
+    print("bot_nlp self-check passed!")
